@@ -24,6 +24,7 @@
 #include "llvm/Support/Debug.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromComputePass.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition.h"
 
@@ -61,6 +62,7 @@ void AddDynamicCVPipelinePass::runOnOperation()
     // todo: add related passes.
     pm.addPass(createPlanComputeBlockPass());
     pm.addPass(createSplitDataflowPass());
+    pm.addPass(createSeparateMemoryFromComputePass());
     pm.addPass(createAddControlFlowConditionPass());
 
     if (failed(runPipeline(pm, getOperation()))) {
