@@ -70,14 +70,6 @@ llvm::StringRef getCoreTypeWithIndex(Operation* op, int index) {
   return typeStr;
 }
 
-// Helper: Get BlockId
-int getSsbufferBlockId(Operation* op) {
-  if (auto attr = op->getAttrOfType<IntegerAttr>("ssbuffer.block_id")) {
-    return attr.getInt();
-  }
-  return -1;
-}
-
 // Helper: Check if operation is control flow
 bool DataDependencyAnalysisPass::isControlFlowOp(mlir::Operation *op) {//TOCHECK
   if (!op) return false;

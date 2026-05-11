@@ -99,6 +99,13 @@ private:
 
   mlir::Operation* annotateTightlyCoupledBuffer(mlir::OpBuilder &builder, mlir::Operation* allocOp, mlir::Location loc);
   mlir::Operation* findMainLoopforTransfer(mlir::Operation* endOp, mlir::Operation* startOp);
+  std::pair<mlir::Operation*, mlir::Operation*> createTransferAllocs(
+      mlir::OpBuilder& builder, mlir::Location loc,
+      llvm::ArrayRef<int64_t> shape, mlir::Type elemType, hivm::AddressSpace addrSpace,
+      mlir::Operation* prodEndOp, mlir::Operation* consStartOp,
+      int prodBlockId, int consBlockId,
+      llvm::StringRef prodTag, llvm::StringRef consTag,
+      int transferIndex);
   mlir::Operation* insertVectorToCubeTransfer(mlir::OpBuilder &builder,
                                               mlir::Value srcValue,
                                               mlir::Value normalizedValue,

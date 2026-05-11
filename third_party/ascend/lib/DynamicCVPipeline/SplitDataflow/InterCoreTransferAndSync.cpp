@@ -99,11 +99,11 @@ InterCoreTransferAndSyncPass::getBlockStartEnd(int targetId, mlir::ModuleOp modu
     if (knownOpInBlock) {
       return;
     }
-    auto attr = op->getAttrOfType<mlir::IntegerAttr>("ssbuffer.block_id");
-    if (attr && attr.getInt() == targetId) {
+    if (getSsbufferBlockId(op) == targetId) {
       knownOpInBlock = op;
     }
   });
+
   if (!knownOpInBlock) {
     return {nullptr, nullptr};
   }
@@ -115,12 +115,12 @@ InterCoreTransferAndSyncPass::getBlockStartEnd(int targetId, mlir::ModuleOp modu
   mlir::Operation* end = nullptr;
 
   // Iterate through all operations in the current block
-  for (auto& op : *block) {
-    auto attr = op.getAttrOfType<mlir::IntegerAttr>("ssbuffer.block_id");
-    if (!attr) {
+  for (Operation& op : *block) {
+    int blockId = getSsbufferBlockId(&op);
+    if (blockId == -1) {
       continue;
     }
-    int blockId = attr.getInt();
+
     if (!start) {
       if (targetId == blockId) {
         start = &op;
@@ -185,11 +185,12 @@ bool InterCoreTransferAndSyncPass::isOuterLayerDependency(
   return false;
 }
 
-
 // Nd2NzNormalizer
 SmallVector<int64_t, 2>
 InterCoreTransferAndSyncPass::computeExpectedShape(Value value) {
   auto tensorTy = dyn_cast<TensorType>(value.getType());
+  assert(tensorTy && tensorTy.getRank() == 2 && "source shape is not 2-dim!");
+
   int64_t M = tensorTy.getDimSize(0);
   int64_t N = tensorTy.getDimSize(1);
 
@@ -216,8 +217,7 @@ void InterCoreTransferAndSyncPass::rewriteMatmulWithNewShape(
     OpBuilder &builder,
     Operation* matmulOp,
     Location loc) {
-  auto cidAttr = matmulOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int matmulOpBlockId = cidAttr.getInt();
+  int matmulOpBlockId = getSsbufferBlockId(matmulOp);
 
   Value lhs = matmulOp->getOperands()[0];
   Value rhs = matmulOp->getOperands()[1];
@@ -290,13 +290,13 @@ void InterCoreTransferAndSyncPass::rewriteTransposeWithNewShape(
   // Create new empty tensor with new shape
   auto tensorEmptyOp = builder.create<tensor::EmptyOp>(
       loc, newOutputShape, elemType);
-  attachCommonTags(tensorEmptyOp, transposeOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id").getInt(), "CUBE");
+  attachCommonTags(tensorEmptyOp, getSsbufferBlockId(transposeOp), "CUBE");
   Value transposeOpResult = transposeOp->getResult(0);
   transposeOp->setOperand(1, tensorEmptyOp.getResult());
   transposeOp->getResult(0).setType(expectedType);
-  transposeOpResult.replaceAllUsesWith(transposeOp->getResult(0));
 }
 
+// padding v->c tensor
 mlir::Value InterCoreTransferAndSyncPass::normalizeIfNeeded(OpBuilder &builder, DependencyInfo& dep, Location loc,
                                                mlir::Value origValue, SmallVector<int64_t, 2> expectedShape, int originBlockId) {
   auto origTensorType = dyn_cast<RankedTensorType>(origValue.getType());
@@ -330,19 +330,31 @@ mlir::Value InterCoreTransferAndSyncPass::normalizeIfNeeded(OpBuilder &builder, 
   attachCommonTags(linalgFillOp, originBlockId, "VECTOR");
   attachCommonTags(tensorInsertSliceOp, originBlockId, "VECTOR");
   int cId = dep.iniConsumerBlockId;
+  LOG_DEBUG("int cId = dep.iniConsumerBlockId;" << cId << "\n");
   for (Operation *user : origValue.getUsers()) {
-    if (auto blockIdAttr = user->getAttrOfType<IntegerAttr>("ssbuffer.block_id")) {
-      int userBlockId = blockIdAttr.getInt();
-      if (userBlockId == cId) {
-        user->replaceUsesOfWith(origValue, tensorInsertSliceOp.getResult());
-        if (auto matmulOp = dyn_cast<linalg::MatmulOp>(user)) {
-          rewriteMatmulWithNewShape(builder, matmulOp, loc);
-        } else if (auto transposeOp = dyn_cast<linalg::TransposeOp>(user)) {
-          rewriteTransposeWithNewShape(builder, transposeOp, loc);
+    LOG_DEBUG(*user << "\n");
+    int userBlockId = getSsbufferBlockId(user);
+    LOG_DEBUG("int userBlockId = getSsbufferBlockId(user);" << userBlockId << "\n");
+    if (userBlockId == -1 || userBlockId != cId) {
+      continue;
+    }
+    user->replaceUsesOfWith(origValue, tensorInsertSliceOp.getResult());
+    if (auto matmulOp = dyn_cast<linalg::MatmulOp>(user)) {
+      rewriteMatmulWithNewShape(builder, matmulOp, loc);
+      continue;
+    }
+    if (auto transposeOp = dyn_cast<linalg::TransposeOp>(user)) {
+      LOG_DEBUG("before rewriteTransposeWithNewShape\n");
+      rewriteTransposeWithNewShape(builder, transposeOp, loc);
+      LOG_DEBUG("after rewriteTransposeWithNewShape\n");
+      for (Operation *transposeuser : transposeOp->getUsers()) {
+        auto matmulOp = dyn_cast<linalg::MatmulOp>(transposeuser);
+        if (matmulOp && getSsbufferBlockId(matmulOp) == cId) {
           rewriteMatmulWithNewShape(builder, matmulOp, loc);
         }
       }
     }
+
   }
   cubeValueMapping[origValue] = tensorInsertSliceOp.getResult();
   return tensorInsertSliceOp.getResult();
@@ -353,66 +365,63 @@ void InterCoreTransferAndSyncPass::Nd2NzNormalize(OpBuilder &builder, Dependency
   Value newValue = origValue;
   // Step 0: Check if this Value has already been processed
   auto it = vecValueMapping.find(origValue);
-  if (it == vecValueMapping.end()) {
-    // Step 1: Compute expected shape
-    SmallVector<int64_t, 2> expectedShape = computeExpectedShape(origValue);
-    auto vidAttr = origValue.getDefiningOp()->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    int originBlockId = vidAttr.getInt();
-    // Step 2: If shapes match, return original value
-    if (!isShapeExpected(origValue, expectedShape)) {
-      newValue = normalizeIfNeeded(builder, dep, loc, origValue, expectedShape, originBlockId);
-    }
-    auto srcTensorType = cast<RankedTensorType>(newValue.getType());
-    int64_t M = srcTensorType.getDimSize(0);
-    int64_t N = srcTensorType.getDimSize(1);
-    Type elemType = srcTensorType.getElementType();
-
-    int64_t blk = getBlockElemsFor32BAlign(elemType);
-
-    SmallVector<int64_t, 3> shape3D = {M, N / blk, blk};
-    // transpose: 64x8x8 -> 8x64x8
-    SmallVector<int64_t, 3> shapeTrans = {N / blk, M, blk};
-    // reshape2: 8x64x8 -> 8x4x16x8
-    SmallVector<int64_t, 4> shapeFinal = {N/blk, M/16, 16, blk};
-
-    auto type3D    = RankedTensorType::get(shape3D, elemType);
-    auto typeTrans = RankedTensorType::get(shapeTrans, elemType);
-    auto typeFinal = RankedTensorType::get(shapeFinal, elemType);
-    builder.setInsertionPointAfter(newValue.getDefiningOp());
-    auto reshape3Dcst = builder.create<arith::ConstantOp>(
-        loc, builder.getI64TensorAttr(shape3D));
-    auto reshape3DOp = builder.create<tensor::ReshapeOp>(
-        loc, type3D, newValue, reshape3Dcst );
-
-    auto emptyTrans = builder.create<tensor::EmptyOp>(loc, shapeTrans, elemType);
-    SmallVector<int64_t, 4> order = {1, 0, 2};
-    auto transposeOp = builder.create<linalg::TransposeOp>(
-        loc,
-        reshape3DOp.getResult(),
-        emptyTrans.getResult(),
-        order);
-    auto reshape4Dcst = builder.create<arith::ConstantOp>(
-        loc, builder.getI64TensorAttr(shapeFinal));
-    auto reshape4DOp = builder.create<tensor::ReshapeOp>(
-        loc, typeFinal, transposeOp->getResult(0), reshape4Dcst);
-
-    attachCommonTags(reshape3Dcst, originBlockId, "VECTOR");
-    attachCommonTags(reshape3DOp, originBlockId, "VECTOR");
-    attachCommonTags(emptyTrans, originBlockId, "VECTOR");
-    attachCommonTags(transposeOp, originBlockId, "VECTOR");
-    attachCommonTags(reshape4Dcst, originBlockId, "VECTOR");
-    attachCommonTags(reshape4DOp, originBlockId, "VECTOR");
-    LOG_DEBUG("[reshape3Dcst]: " << *reshape3Dcst << "\n");
-    LOG_DEBUG("[reshape3DOp]: " << *reshape3DOp << "\n");
-    LOG_DEBUG("[emptyTrans]: " << emptyTrans << "\n");
-    LOG_DEBUG("[transposeOp]: " << *transposeOp << "\n");
-    LOG_DEBUG("[reshape4Dcst]: " << *reshape4Dcst << "\n");
-    LOG_DEBUG("[reshape4DOp]: " << *reshape4DOp << "\n");
-    vecValueMapping[origValue] = reshape4DOp.getResult();
+  if (it != vecValueMapping.end()) {
+    return;
   }
+  // Step 1: Compute expected shape
+  SmallVector<int64_t, 2> expectedShape = computeExpectedShape(origValue);
+  int originBlockId = getSsbufferBlockId(origValue.getDefiningOp());
+  // Step 2: If shapes match, return original value
+  if (!isShapeExpected(origValue, expectedShape)) {
+    newValue = normalizeIfNeeded(builder, dep, loc, origValue, expectedShape, originBlockId);
+  }
+  // Step 3: insert nd2nz
+  auto srcTensorType = cast<RankedTensorType>(newValue.getType());
+  int64_t M = srcTensorType.getDimSize(0);
+  int64_t N = srcTensorType.getDimSize(1);
+  Type elemType = srcTensorType.getElementType();
+
+  int64_t blk = getBlockElemsFor32BAlign(elemType);
+
+  SmallVector<int64_t, 3> shape3D = {M, N / blk, blk};
+  SmallVector<int64_t, 3> shapeTrans = {N / blk, M, blk};
+  SmallVector<int64_t, 4> shapeFinal = {N/blk, M/16, 16, blk};
+
+  auto type3D    = RankedTensorType::get(shape3D, elemType);
+  auto typeTrans = RankedTensorType::get(shapeTrans, elemType);
+  auto typeFinal = RankedTensorType::get(shapeFinal, elemType);
+  builder.setInsertionPointAfter(newValue.getDefiningOp());
+  auto reshape3Dcst = builder.create<arith::ConstantOp>(
+      loc, builder.getI64TensorAttr(shape3D));
+  auto reshape3DOp = builder.create<tensor::ReshapeOp>(
+      loc, type3D, newValue, reshape3Dcst );
+
+  auto emptyTrans = builder.create<tensor::EmptyOp>(loc, shapeTrans, elemType);
+  SmallVector<int64_t, 4> transposeOrder = {1, 0, 2};
+  auto transposeOp = builder.create<linalg::TransposeOp>(
+      loc,
+      reshape3DOp.getResult(),
+      emptyTrans.getResult(),
+      transposeOrder);
+  auto reshape4Dcst = builder.create<arith::ConstantOp>(
+      loc, builder.getI64TensorAttr(shapeFinal));
+  auto reshape4DOp = builder.create<tensor::ReshapeOp>(
+      loc, typeFinal, transposeOp->getResult(0), reshape4Dcst);
+
+  attachCommonTags(reshape3Dcst, originBlockId, "VECTOR");
+  attachCommonTags(reshape3DOp, originBlockId, "VECTOR");
+  attachCommonTags(emptyTrans, originBlockId, "VECTOR");
+  attachCommonTags(transposeOp, originBlockId, "VECTOR");
+  attachCommonTags(reshape4Dcst, originBlockId, "VECTOR");
+  attachCommonTags(reshape4DOp, originBlockId, "VECTOR");
+  LOG_DEBUG("[reshape3DOp]: " << *reshape3DOp << "\n");
+  LOG_DEBUG("[transposeOp]: " << *transposeOp << "\n");
+  LOG_DEBUG("[reshape4DOp]: " << *reshape4DOp << "\n");
+  vecValueMapping[origValue] = reshape4DOp.getResult();
+
 }
 
-// TransferExecutor
+// mark memref.alloc
 mlir::Operation* InterCoreTransferAndSyncPass::annotateTightlyCoupledBuffer(OpBuilder &builder, Operation* allocOp, Location loc) {
   builder.setInsertionPointAfter(allocOp);
   auto markAllocOp = builder.create<annotation::MarkOp>(
@@ -427,6 +436,7 @@ mlir::Operation* InterCoreTransferAndSyncPass::annotateTightlyCoupledBuffer(OpBu
   return markAllocOp;
 }
 
+// find the insert point for memref.alloc
 Operation* InterCoreTransferAndSyncPass::findMainLoopforTransfer(Operation* endOp, Operation* startOp) {
   Operation* lca = endOp->getParentOp();
   assert(lca == startOp->getParentOp() &&
@@ -441,6 +451,55 @@ Operation* InterCoreTransferAndSyncPass::findMainLoopforTransfer(Operation* endO
   return nullptr;
 }
 
+std::pair<Operation*, Operation*> InterCoreTransferAndSyncPass::createTransferAllocs(
+    OpBuilder& builder, Location loc,
+    ArrayRef<int64_t> shape, Type elemType, hivm::AddressSpace addrSpace,
+    Operation* prodEndOp, Operation* consStartOp,
+    int prodBlockId, int consBlockId,
+    StringRef prodTag, StringRef consTag,
+    int transferIndex) {
+
+  auto addressSpaceAttr = builder.getAttr<hivm::AddressSpaceAttr>(addrSpace);
+  auto allocType = MemRefType::get(shape, elemType, /*layout=*/nullptr, addressSpaceAttr);
+
+  Operation* prodAllocOp = nullptr;
+  Operation* consAllocOp = nullptr;
+
+  Operation* mainLoopOp = findMainLoopforTransfer(prodEndOp, consStartOp);
+
+  if (mainLoopOp) {
+    builder.setInsertionPoint(mainLoopOp);
+    prodAllocOp = builder.create<memref::AllocOp>(loc, allocType);
+    auto markProdOp = annotateTightlyCoupledBuffer(builder, prodAllocOp, loc);
+    consAllocOp = builder.create<memref::AllocOp>(loc, allocType);
+    auto markConsOp = annotateTightlyCoupledBuffer(builder, consAllocOp, loc);
+
+    int loopBlockId = getSsbufferBlockId(mainLoopOp);
+    attachTransferTags(prodAllocOp, loopBlockId, prodTag, transferIndex);
+    attachTransferTags(consAllocOp, loopBlockId, consTag, transferIndex);
+    attachTransferTags(markProdOp, loopBlockId, prodTag, transferIndex);
+    attachTransferTags(markConsOp, loopBlockId, consTag, transferIndex);
+
+    builder.setInsertionPointAfter(prodEndOp);
+  } else {
+    builder.setInsertionPoint(consStartOp);
+    consAllocOp = builder.create<memref::AllocOp>(loc, allocType);
+    auto markConsOp = annotateTightlyCoupledBuffer(builder, consAllocOp, loc);
+
+    builder.setInsertionPointAfter(prodEndOp);
+    prodAllocOp = builder.create<memref::AllocOp>(loc, allocType);
+    auto markProdOp = annotateTightlyCoupledBuffer(builder, prodAllocOp, loc);
+
+    attachTransferTags(prodAllocOp, prodBlockId, prodTag, transferIndex);
+    attachTransferTags(consAllocOp, consBlockId, consTag, transferIndex);
+    attachTransferTags(markProdOp, prodBlockId, prodTag, transferIndex);
+    attachTransferTags(markConsOp, consBlockId, consTag, transferIndex);
+  }
+  markAllocIndex++;
+
+  return {prodAllocOp, consAllocOp};
+}
+
 Operation* InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(OpBuilder &builder, Value srcValue, Value normalizedValue, Operation* vectorEndOp, Operation* cubeStartOp, Location loc, int transferIndex, int iniConsumerId) {
   LOG_DEBUG("Inserting [Vector->Cube] transfer for value: " << srcValue << "\n");
   // Step 1: Get input information (2D tensor: MxN)
@@ -448,48 +507,12 @@ Operation* InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(OpBuilder &b
   auto normalizedTensorType = cast<RankedTensorType>(normalizedValue.getType());
   Type elemType = srcTensorType.getElementType();
 
-  auto vidAttr = vectorEndOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int vecBlockId = vidAttr.getInt();
-  auto cidAttr = cubeStartOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int cubeBlockId = cidAttr.getInt();
+  int vecBlockId = getSsbufferBlockId(vectorEndOp);
+  int cubeBlockId = getSsbufferBlockId(cubeStartOp);
 
-  auto cbufaddressSpaceAttr = builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::L1);
-  auto allocType = MemRefType::get(
-      normalizedTensorType.getShape(),
-      elemType,
-      /*layout=*/nullptr,
-      cbufaddressSpaceAttr
-  );
-  Operation* vecAllocOp;
-  Operation* cubeAllocOp;
-  // Allocate memory outside mainloop or inside func for data transfer/reception
-  Operation* mainLoopOp = findMainLoopforTransfer(vectorEndOp, cubeStartOp);
-  if (mainLoopOp) {
-    builder.setInsertionPoint(mainLoopOp);
-    vecAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markVecAllocOp = annotateTightlyCoupledBuffer(builder, vecAllocOp, loc);
-    cubeAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markCubeAllocOp = annotateTightlyCoupledBuffer(builder, cubeAllocOp, loc);
-    auto loopidAttr = mainLoopOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    int loopBlockId = loopidAttr.getInt();
-    attachTransferTags(vecAllocOp, loopBlockId, "VECTOR", transferIndex);
-    attachTransferTags(cubeAllocOp, loopBlockId, "CUBE", transferIndex);
-    attachTransferTags(markVecAllocOp, loopBlockId, "VECTOR", transferIndex);
-    attachTransferTags(markCubeAllocOp, loopBlockId, "CUBE", transferIndex);
-    builder.setInsertionPointAfter(vectorEndOp);
-  } else {
-    builder.setInsertionPoint(cubeStartOp);
-    cubeAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markCubeAllocOp = annotateTightlyCoupledBuffer(builder, cubeAllocOp, loc);
-    builder.setInsertionPointAfter(vectorEndOp);
-    vecAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markVecAllocOp = annotateTightlyCoupledBuffer(builder, vecAllocOp, loc);
-    attachTransferTags(vecAllocOp, vecBlockId, "VECTOR", transferIndex);
-    attachTransferTags(cubeAllocOp, cubeBlockId, "CUBE", transferIndex);
-    attachTransferTags(markVecAllocOp, vecBlockId, "VECTOR", transferIndex);
-    attachTransferTags(markCubeAllocOp, cubeBlockId, "CUBE", transferIndex);
-  }
-  markAllocIndex++;
+  auto [vecAllocOp, cubeAllocOp] = createTransferAllocs(builder, loc,
+      normalizedTensorType.getShape(), elemType, hivm::AddressSpace::L1,
+      vectorEndOp, cubeStartOp, vecBlockId, cubeBlockId, "VECTOR", "CUBE", transferIndex);
 
   auto copyOp = builder.create<hivm::CopyOp>(
       loc,
@@ -505,6 +528,7 @@ Operation* InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(OpBuilder &b
 
   auto nzLayout = hivm::DataLayoutAttr::get(builder.getContext(), hivm::DataLayout::nZ);
   auto ndLayout = hivm::DataLayoutAttr::get(builder.getContext(), hivm::DataLayout::ND);
+  auto cbufaddressSpaceAttr = builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::L1);
   auto newAllocType = MemRefType::get(
       srcTensorType.getShape(),
       elemType,
@@ -535,13 +559,10 @@ Operation* InterCoreTransferAndSyncPass::insertVectorToCubeTransfer(OpBuilder &b
   attachTransferTags(convertLayoutOp, cubeBlockId, "CUBE", transferIndex);
   attachTransferTags(memspaceCastOp, cubeBlockId, "CUBE", transferIndex);
   attachTransferTags(toTensorOp, cubeBlockId, "CUBE", transferIndex);
-  LOG_DEBUG("[convertLayoutOp]: " << *convertLayoutOp << "\n");
-  LOG_DEBUG("[memspaceCastOp]: " << *memspaceCastOp << "\n");
   LOG_DEBUG("[toTensorOp]: " << *toTensorOp << "\n");
 
   for (Operation* user : srcValue.getUsers()) {
-    auto userIdAttr = user->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    int userBlockId = userIdAttr.getInt();
+    int userBlockId = getSsbufferBlockId(user);
     if (userBlockId == iniConsumerId) {
       user->replaceUsesOfWith(srcValue, toTensorOp.getResult());
     }
@@ -556,53 +577,12 @@ Operation* InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(OpBuilder &b
   int64_t N = srcTensorType.getDimSize(1);
   Type elemType = srcTensorType.getElementType();
 
-  auto cidAttr = srcValue.getDefiningOp()->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int cubeBlockId = cidAttr.getInt();
-  auto vidAttr = vectorStartOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int vecBlockId = vidAttr.getInt();
+  int cubeBlockId = getSsbufferBlockId(srcValue.getDefiningOp());
+  int vecBlockId = getSsbufferBlockId(vectorStartOp);
 
-  auto ubaddressSpaceAttr = builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB);
-  auto allocType = MemRefType::get(
-    {M, N},
-    elemType,
-    /*layout=*/nullptr,
-    ubaddressSpaceAttr);
-
-  Operation* cubeAllocOp;
-  Operation* vecAllocOp;
-  // Allocate memory outside mainloop
-  Operation* mainLoopOp = findMainLoopforTransfer(cubeEndOp, vectorStartOp);
-  if (mainLoopOp) {
-    LOG_DEBUG("[mainLoopOp]" << *mainLoopOp << "\n");
-    builder.setInsertionPoint(mainLoopOp);
-    cubeAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markCubeAllocOp = annotateTightlyCoupledBuffer(builder, cubeAllocOp, loc);
-    vecAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markVecAllocOp = annotateTightlyCoupledBuffer(builder, vecAllocOp, loc);
-    auto loopidAttr = mainLoopOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    int loopBlockId = loopidAttr.getInt();
-    attachTransferTags(cubeAllocOp, loopBlockId, "CUBE", transferIndex);
-    attachTransferTags(vecAllocOp, loopBlockId, "VECTOR", transferIndex);
-    attachTransferTags(markVecAllocOp, loopBlockId, "VECTOR", transferIndex);
-    attachTransferTags(markCubeAllocOp, loopBlockId, "CUBE", transferIndex);
-    builder.setInsertionPointAfter(cubeEndOp);
-    LOG_DEBUG("[cubeAllocOp]" << *cubeAllocOp << "\n");
-    LOG_DEBUG("[vecAllocOp]" << *vecAllocOp << "\n");
-  } else {
-    builder.setInsertionPoint(vectorStartOp);
-    vecAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markVecAllocOp = annotateTightlyCoupledBuffer(builder, vecAllocOp, loc);
-    builder.setInsertionPointAfter(cubeEndOp);
-    cubeAllocOp = builder.create<memref::AllocOp>(loc, allocType);
-    auto markCubeAllocOp = annotateTightlyCoupledBuffer(builder, cubeAllocOp, loc);
-    attachTransferTags(cubeAllocOp, cubeBlockId, "CUBE", transferIndex);
-    attachTransferTags(vecAllocOp, vecBlockId, "VECTOR", transferIndex);
-    attachTransferTags(markVecAllocOp, vecBlockId, "VECTOR", transferIndex);
-    attachTransferTags(markCubeAllocOp, cubeBlockId, "CUBE", transferIndex);
-    LOG_DEBUG("[cubeAllocOp]" << *cubeAllocOp << "\n");
-    LOG_DEBUG("[vecAllocOp]" << *vecAllocOp << "\n");
-  }
-  markAllocIndex++;
+  auto [cubeAllocOp, vecAllocOp] = createTransferAllocs(builder, loc,
+      {M, N}, elemType, hivm::AddressSpace::UB,
+      cubeEndOp, vectorStartOp, cubeBlockId, vecBlockId, "CUBE", "VECTOR", transferIndex);
 
   FixpipeDMAModeAttr dmaModeAttr = FixpipeDMAModeAttr::get(builder.getContext(), FixpipeDMAMode::NZ2ND);
   auto fixpipeOp = builder.create<hivm::FixpipeOp>(
@@ -636,12 +616,10 @@ Operation* InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(OpBuilder &b
 
   attachTransferTags(memspaceCastOp, vecBlockId, "VECTOR", transferIndex);
   attachTransferTags(toTensorOp, vecBlockId, "VECTOR", transferIndex);
-  LOG_DEBUG("[memspaceCastOp]: " << *memspaceCastOp << "\n");
   LOG_DEBUG("[toTensorOp]: " << *toTensorOp << "\n");
 
   for (Operation* user : srcValue.getUsers()) {
-    auto userIdAttr = user->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-    int userBlockId = userIdAttr.getInt();
+    int userBlockId = getSsbufferBlockId(user);
     if (userBlockId == iniConsumerId) {
       user->replaceUsesOfWith(srcValue, toTensorOp.getResult());
     }
@@ -660,10 +638,8 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(OpBuilder &builder, Opera
   auto pipeMAttr = PipeAttr::get(builder.getContext(), hivm::PIPE::PIPE_M);
   auto flagId = builder.getIntegerAttr(builder.getI64Type(), flag);
 
-  auto produceridAttr = transferOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int producerBlockId = produceridAttr.getInt();
-  auto consumeridAttr = consumerStartOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  int consumerBlockId = consumeridAttr.getInt();
+  int producerBlockId = getSsbufferBlockId(transferOp);
+  int consumerBlockId = getSsbufferBlockId(consumerStartOp);
 
   Operation* mainLoopOp = findMainLoopforTransfer(transferOp, consumerStartOp);
 
@@ -688,8 +664,7 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(OpBuilder &builder, Opera
       builder.setInsertionPointAfter(mainLoopOp);
       auto waitOpForEnd = builder.create<SyncBlockWaitOp>(loc, cubeCoreAttr, pipeVAttr, pipeFixAttr, flagId);
 
-      auto startEndIdAttr = mainLoopOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-      int startEndBlockId = startEndIdAttr.getInt();
+      int startEndBlockId = getSsbufferBlockId(mainLoopOp);
       attachTransferTags(setOpForStart, startEndBlockId, "VECTOR", transferIndex);
       attachTransferTags(waitOpForEnd , startEndBlockId, "CUBE", transferIndex);
     }
@@ -716,8 +691,7 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(OpBuilder &builder, Opera
       builder.setInsertionPointAfter(mainLoopOp);
       auto waitOpForEnd  = builder.create<SyncBlockWaitOp>(loc, vecCoreAttr, pipeMAttr, pipeMte3Attr, flagId);
 
-      auto startEndIdAttr = mainLoopOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-      int startEndBlockId = startEndIdAttr.getInt();
+      int startEndBlockId = getSsbufferBlockId(mainLoopOp);
       attachTransferTags(setOpForStart, startEndBlockId, "CUBE", transferIndex);
       attachTransferTags(waitOpForEnd , startEndBlockId, "VECTOR", transferIndex);
     }
@@ -754,17 +728,13 @@ void InterCoreTransferAndSyncPass::insertPipeSSync(OpBuilder &builder,
   builder.setInsertionPoint(consumerOp);
   auto waitOp = builder.create<SyncBlockWaitOp>(loc, dstCoreAttr, srcPipeAttr, dstPipeAttr, flagId);
 
-  auto prodIdAttr = producerOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-  auto consIdAttr = consumerOp->getAttrOfType<IntegerAttr>("ssbuffer.block_id");
-
-  if (prodIdAttr) {
-    int prodBlockId = prodIdAttr.getInt();
+  int prodBlockId = getSsbufferBlockId(producerOp);
+  int consBlockId = getSsbufferBlockId(consumerOp);
+  if (prodBlockId != -1) {
     StringRef prodCoreType = isCubeToVector ? "CUBE" : "VECTOR";
     attachCommonTags(setOp, prodBlockId, prodCoreType);
   }
-
-  if (consIdAttr) {
-    int consBlockId = consIdAttr.getInt();
+  if (consBlockId != -1) {
     StringRef consCoreType = isCubeToVector ? "VECTOR" : "CUBE";
     attachCommonTags(waitOp, consBlockId, consCoreType);
   }
@@ -797,6 +767,7 @@ LogicalResult InterCoreTransferAndSyncPass::handleVectorToCube(
   Operation* transferOp = insertVectorToCubeTransfer(builder, srcValue, normalizedVal, prodEnd, consStart, loc, transferIndex, dep.iniConsumerBlockId);
 
   int flagId = flagManager.acquireId(prodStart);
+  assert(flagId != -1 && "No available flag_id!!");
   auto [newProdStart, newProdEnd] = getBlockStartEnd(dep.producerBlockId, module);
   auto [newConsStart, newConsEnd] = getBlockStartEnd(dep.consumerBlockId, module);
   insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId, loc, transferIndex);
@@ -830,6 +801,7 @@ LogicalResult InterCoreTransferAndSyncPass::handleCubeToVector(
   auto [newProdStart, newProdEnd] = getBlockStartEnd(dep.producerBlockId, module); // C Block
   auto [newConsStart, newConsEnd] = getBlockStartEnd(dep.consumerBlockId, module); // V Block
   int flagId = flagManager.acquireId(newProdStart);
+  assert(flagId != -1 && "No available flag_id!!");
   insertInterCoreSync(builder, transferOp, newConsStart, newConsEnd, flagId, loc, transferIndex);
 
   transferIndex++;
@@ -864,6 +836,7 @@ LogicalResult InterCoreTransferAndSyncPass::handleMemoryDependency(
 
   // Get flag ID
   int flagId = flagManager.acquireId(prodStart);
+  assert(flagId != -1 && "No available flag_id!!");
 
   // Determine sync direction: CUBE->VECTOR or VECTOR->CUBE
   bool isCubeToVector = (dep.type == DependencyType::CubeToVector);
@@ -896,6 +869,14 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(FlagIdManager& f
 
   llvm::SmallVector<DependencyInfo>& V2CDependencies = info.getV2CDependencies();
   LOG_DEBUG("[DEBUG] V2CDependencies size: " << V2CDependencies.size() << "\n");
+  for (size_t i = 0; i < V2CDependencies.size(); ++i) {
+    auto& dep = V2CDependencies[i];
+    LOG_DEBUG("[V2C-" << i << "] producerBlockId = " << dep.producerBlockId
+            << ", consumerBlockId = " << dep.consumerBlockId
+            << ", iniProducerBlockId = " << dep.iniProducerBlockId
+            << ", iniConsumerBlockId = " << dep.iniConsumerBlockId
+            << ", value = " << dep.value << "\n");
+  }
   // Step 1: Handle V->C dependencies
   for (auto& dep : V2CDependencies) {
     Location loc = dep.value.getLoc();
@@ -981,6 +962,8 @@ void InterCoreTransferAndSyncPass::runOnOperation()
     return;
   }
 
+  LOG_DEBUG("Module after InterCoreTransferAndSyncPass:\n" << module << "\n");
+
   LOG_DEBUG("--- exit InterCoreTransferAndSyncPass --->\n");
 }
 
@@ -991,6 +974,14 @@ namespace triton {
 std::unique_ptr<OperationPass<ModuleOp>> createInterCoreTransferAndSyncPass()
 {
     return std::make_unique<InterCoreTransferAndSyncPass>();
+}
+
+// Helper: Get BlockId
+int getSsbufferBlockId(Operation* op) {
+  if (auto attr = op->getAttrOfType<IntegerAttr>("ssbuffer.block_id")) {
+    return attr.getInt();
+  }
+  return -1;
 }
 
 } // namespace triton

@@ -48,7 +48,7 @@ void AddBlockIdForControlOpsPass::runOnOperation()
     }
   });
 
-  LOG_DEBUG("[InterCoreTransferAndSyncPass] maxBlockId: " << maxBlockId << "\n");
+  LOG_DEBUG("maxBlockId: " << maxBlockId << "\n");
 
   // Step 2: add block_id for control flow ops
   module.walk([&](Operation *op) {
