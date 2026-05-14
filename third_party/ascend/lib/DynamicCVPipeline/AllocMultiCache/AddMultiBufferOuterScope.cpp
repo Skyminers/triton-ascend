@@ -28,6 +28,8 @@ namespace triton {
 
 // Maximum number of flag allocation attempts per transfer group
 static constexpr int kMaxFlagAttempts = 16;
+static constexpr int kMaxTotalFlags = 15;
+static constexpr int kFlagThresholdSingleBuffer = 7;
 
 // --- Attribute helpers ---
 
@@ -354,8 +356,7 @@ static int collectTransferGroupData(
     for (auto &p : opsByTid) {
         TransferGroupInfo info;
         if (buildTransferGroupData(p.first, p.second, flagIdMgr, info)) { continue; }
-        if ((info.senderChain.transferOp || info.receiverChain.transferOp)
-            && info.outputFlag >= 0) {
+        if (info.senderChain.transferOp || info.receiverChain.transferOp) {
             groups[p.first] = info;
         }
     }
@@ -556,9 +557,8 @@ static int createOutputBuffers(DenseMap<int, TransferGroupInfo> &groups, ModuleO
 /// Tag consumer-side alloc and transferOp with crossDeps marks
 static int addConsumerCrossDepsTags(TransferGroupInfo &g, ModuleOp module)
 {
-    bool consumerIsVector = g.isCtoV;
-    auto &consumerBuf = consumerIsVector ? g.receiverBuf : g.senderBuf;
-    auto &consumerChain = consumerIsVector ? g.receiverChain : g.senderChain;
+    auto &consumerBuf = g.receiverBuf;
+    auto &consumerChain = g.receiverChain;
 
     OpBuilder builder(module.getContext());
 
@@ -884,6 +884,28 @@ void AddMultiBufferOuterScopePass::runOnOperation()
     // Tag consumer-side alloc and transferOp with crossDeps (both modes)
     for (auto &p : groups)
         addConsumerCrossDepsTags(p.second, module);
+
+    // Check flag ID budget: hardware supports 16 flags (0-15).
+    // Each cross-core double-buffer group needs 2 flags (input + output).
+    std::set<int> usedFlags;
+    module.walk([&](Operation *op) {
+        if (isa<hivm::SyncBlockSetOp>(op) || isa<hivm::SyncBlockWaitOp>(op)) {
+            int f = getFlagFromSyncOp(op);
+            if (f >= 0) usedFlags.insert(f);
+        }
+    });
+    int flagCount = static_cast<int>(usedFlags.size());
+    LDBG("[FlagBudget] used=" << flagCount << " (max=" << (kMaxTotalFlags + 1) << ")");
+    if (flagCount > kMaxTotalFlags) {
+        LDBG("[FlagBudget] FATAL: flag count " << flagCount << " > " << kMaxTotalFlags << ", halting pass");
+        module->emitError() << "[FlagBudget] flag count " << flagCount << " > " << kMaxTotalFlags << ", halting pass";
+        signalPassFailure();
+        return;
+    }
+    if (flagCount > kFlagThresholdSingleBuffer) {
+        LDBG("[FlagBudget] flag count " << flagCount << " > " << kFlagThresholdSingleBuffer << ", forcing single-buffer");
+        isDoubleBuf = false;
+    }
 
     if (isDoubleBuf) {
         LDBG("[Step 2/3] Start: output buffer creation");

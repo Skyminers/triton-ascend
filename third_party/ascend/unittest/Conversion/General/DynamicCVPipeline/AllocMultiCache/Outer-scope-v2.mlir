@@ -68,8 +68,7 @@ func.func @tc_v2_03_cube_receiver_convert() {
 }
 }
 
-// CHECK: crossDeps = [1 : i32, 1 : i32]
-// CHECK: crossDeps = [2 : i32, 1 : i32]
-// CHECK: crossDeps = [2 : i32, 0 : i32]
+// crossDeps on receiver-side alloc [tid,1] and transferOp [tid,0]
+// CHECK: crossDeps = [1 : i32, 0 : i32]
 // CHECK: crossDeps = [3 : i32, 1 : i32]
 // CHECK: crossDeps = [3 : i32, 0 : i32]
