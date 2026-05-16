@@ -51,9 +51,6 @@ private:
   // Traverse Module to find all existing flag_id to prevent duplicate allocation
   void scanExistingFlags(ModuleOp module);
 
-  // Try to reuse flag (return reusable id or INVALID_FLAG_ID)
-  int tryReuseFlag(Operation* insertionPoint);
-
   // Currently allocated maximum ID
   int64_t currentMaxId = 0;
 
