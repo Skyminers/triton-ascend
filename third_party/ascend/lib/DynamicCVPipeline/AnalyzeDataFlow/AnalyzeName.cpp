@@ -21,54 +21,75 @@
  */
 
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
-#include "mlir/Pass/PassManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 
-static constexpr const char *DEBUG_TYPE = "analyze-data-flow";
+static constexpr const char *DEBUG_TYPE = "analyze-name";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
+#define LDBG(...) \
+LLVM_DEBUG({ \
+  DBGS(); \
+  llvm::dbgs() << __VA_ARGS__; \
+  llvm::dbgs() << "\n"; \
+})
 
 using namespace mlir;
 using namespace triton;
 
-void AnalyzeDataFlowPass::runOnOperation()
+namespace {
+
+static constexpr llvm::StringLiteral interceptrFunc[] {
+  "_attn_bwd",
+  "_kernel_matmul_fp8_now_non_persistent",
+  "bmm_kernel",
+};
+
+static LogicalResult verifyFuncNames(ModuleOp module)
+{
+  bool intercepted = false;
+
+  module.walk([&](func::FuncOp funcOp) -> WalkResult {
+    if (!llvm::is_contained(interceptrFunc, funcOp.getSymName())) {
+      return WalkResult::advance();
+    }
+
+    LDBG("[INFO]: DynamicCVPipeline is interrupted by function name: " << funcOp.getSymName());
+    intercepted = true;
+    return WalkResult::interrupt();
+  });
+
+  if (!intercepted) {
+    return success();
+  }
+
+  return failure();
+}
+
+} // namespace
+
+void AnalyzeNamePass::runOnOperation()
 {
   ModuleOp module = getOperation();
 
-  LDBG("Enter AnalyzeDataFlow pass.");
+  LDBG("Before AnalyzeName:\n" << module << "\n");
 
-  PassManager pm(&getContext(), module.getOperationName());
-
-  pm.addPass(createAnalyzeNamePass());
-
-  pm.addPass(createAnalyzeScopePass());
-
-  pm.addPass(createAnalyzeArgsPass());
-
-  pm.addPass(createAnalyzeFlagPass());
-
-  if (failed(runPipeline(pm, module))) {
+  if (failed(verifyFuncNames(module))) {
+    CVPipeline::setFallbackAttr(module);
     signalPassFailure();
+    return;
   }
 
-  LDBG("Exit AnalyzeDataFlow pass.");
+  LDBG("After AnalyzeName:\n" << module << "\n");
 }
 
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeDataFlowPass()
+std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeNamePass()
 {
-  return std::make_unique<AnalyzeDataFlowPass>();
-}
-
-void registerAnalyzeDataFlowPasses()
-{
-  registerPass(createAnalyzeNamePass);
-  registerPass(createAnalyzeArgsPass);
-  registerPass(createAnalyzeFlagPass);
-  registerPass(createAnalyzeScopePass);
-  registerPass(createAnalyzeDataFlowPass);
+  return std::make_unique<AnalyzeNamePass>();
 }
 
 } // namespace triton
