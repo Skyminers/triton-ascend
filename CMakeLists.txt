@@ -302,6 +302,7 @@ if(TRITON_BUILD_PYTHON_MODULE AND NOT WIN32)
   # Check if the platform is MacOS
   if(APPLE)
     set(PYTHON_LDFLAGS "-undefined dynamic_lookup")
+    target_link_libraries(entryC PRIVATE ${PYTHON_LDFLAGS})
   endif()
 
   target_link_libraries(triton PRIVATE ${PYTHON_LDFLAGS})
