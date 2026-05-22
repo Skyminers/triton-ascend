@@ -20,56 +20,39 @@
  * THE SOFTWARE.
  */
 
-#include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
-#include "mlir/Pass/PassManager.h"
-#include "llvm/Support/Debug.h"
+#ifndef TRITON_ADAPTER_MOVE_UPDATE_OPS_TO_FIRST_USE_H
+#define TRITON_ADAPTER_MOVE_UPDATE_OPS_TO_FIRST_USE_H
 
-static constexpr const char *DEBUG_TYPE = "analyze-data-flow";
-#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
-#define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
-
-using namespace mlir;
-using namespace triton;
-
-void AnalyzeDataFlowPass::runOnOperation()
-{
-  ModuleOp module = getOperation();
-
-  LDBG("Enter AnalyzeDataFlow pass.");
-
-  PassManager pm(&getContext(), module.getOperationName());
-
-  pm.addPass(createAnalyzeNamePass());
-
-  pm.addPass(createAnalyzeScopePass());
-
-  pm.addPass(createAnalyzeArgsPass());
-
-  pm.addPass(createAnalyzeFlagPass());
-
-  if (failed(runPipeline(pm, module))) {
-    signalPassFailure();
-  }
-
-  LDBG("Exit AnalyzeDataFlow pass.");
-}
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
 
 namespace mlir {
 namespace triton {
 
-std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeDataFlowPass()
-{
-  return std::make_unique<AnalyzeDataFlowPass>();
-}
+class RefineArgsBlockIdPass : public PassWrapper<RefineArgsBlockIdPass, OperationPass<ModuleOp>> {
+  public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RefineArgsBlockIdPass)
 
-void registerAnalyzeDataFlowPasses()
-{
-  registerPass(createAnalyzeNamePass);
-  registerPass(createAnalyzeArgsPass);
-  registerPass(createAnalyzeFlagPass);
-  registerPass(createAnalyzeScopePass);
-  registerPass(createAnalyzeDataFlowPass);
-}
+    RefineArgsBlockIdPass() = default;
+
+    void runOnOperation() override;
+
+    static constexpr ::llvm::StringRef getArgumentName() { return "refine-args-block-id"; }
+    ::llvm::StringRef getArgument() const override { return "refine-args-block-id"; }
+    ::llvm::StringRef getDescription() const override
+    {
+        return "Move update ops for iteration variables to the first block that uses them in main loops";
+    }
+    ::llvm::StringRef getName() const override { return "RefineArgsBlockIdPass"; }
+
+  private:
+};
+
+std::unique_ptr<OperationPass<ModuleOp>> createRefineArgsBlockIdPass();
+
+void registerRefineArgsBlockIdPasses();
 
 } // namespace triton
 } // namespace mlir
+
+#endif // TRITON_ADAPTER_MOVE_UPDATE_OPS_TO_FIRST_USE_H
