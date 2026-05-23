@@ -105,9 +105,26 @@ public:
   }
 };
 
+// Pass for analyzing cube control flow input chain
+class AnalyzeCubeControlFlowInputChainPass 
+    : public PassWrapper<AnalyzeCubeControlFlowInputChainPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AnalyzeCubeControlFlowInputChainPass)
+
+  AnalyzeCubeControlFlowInputChainPass() = default;
+
+  void runOnOperation() override;
+
+  llvm::StringRef getArgument() const override { return "analyze-cube-control-flow-input-chain"; }
+  llvm::StringRef getDescription() const override {
+    return "Analyze cube control flow input chain";
+  }
+};
+
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeArgsPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeFlagPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeNamePass();
+std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeCubeContolFLowInputChainPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeDataFlowPass();
 std::unique_ptr<OperationPass<ModuleOp>> createAnalyzeScopePass();
 
