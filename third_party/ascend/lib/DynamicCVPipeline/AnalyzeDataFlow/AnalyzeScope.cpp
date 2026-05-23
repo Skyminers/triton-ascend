@@ -29,6 +29,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 
 static constexpr const char *DEBUG_TYPE = "analyze-scope";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -42,8 +43,75 @@ LLVM_DEBUG({ \
 using namespace llvm;
 using namespace mlir;
 using namespace triton;
+using namespace CVPipeline;
 
 namespace {
+static bool isVectorScope(scope::ScopeOp scopeOp)
+{
+    auto coreTypeAttr = scopeOp->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name);
+    if (!coreTypeAttr) {
+        return false;
+    }
+    return coreTypeAttr.getTcoretype() == hivm::TCoreType::VECTOR;
+}
+
+static bool checkVecScopeMainLoop(ModuleOp module) {
+  bool hasMainLoopFor = false;
+  bool allSatisfy = true;
+
+  module.walk([&](scope::ScopeOp scopeOp) -> WalkResult {
+    if (!isVectorScope(scopeOp)) {
+      return WalkResult::advance();
+    }
+
+    scopeOp.walk([&](scf::ForOp forOp) -> WalkResult {
+      if (!forOp->hasAttr(CVPipeline::kMainLoop)) {
+        return WalkResult::advance();
+      }
+
+      hasMainLoopFor = true;
+      bool forSatisfies = false;
+
+      forOp.walk([&](mlir::Operation *op) -> WalkResult {
+        if (op == forOp) {
+          return WalkResult::advance();
+        }
+        bool hasTensorResult = false;
+        for (Value result : op->getResults()) {
+          if (isa<RankedTensorType>(result.getType())) {
+            hasTensorResult = true;
+            break;
+          }
+        }
+
+        // Check if all vector calculations are derived from matmul splitting.
+        // Check "ssbuffer.add_from_matmul" for vadd
+        // Check "ssbuffer.transfer_id" for injected bufferization.to_tensor
+        if (hasTensorResult && !op->hasAttr("ssbuffer.add_from_matmul") && !op->hasAttr(CVPipeline::kTransferId)) {
+          forSatisfies = true;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+
+      // return true only when all mainloop meet the rule
+      if (!forSatisfies) {
+        allSatisfy = false;
+        return WalkResult::interrupt();
+      }
+
+      return WalkResult::advance();
+    });
+
+    if (!allSatisfy) {
+      return WalkResult::interrupt();
+    }
+
+    return WalkResult::advance();
+  });
+
+  return hasMainLoopFor && allSatisfy;
+}
 
 static LogicalResult verifyMainLoop(ModuleOp module)
 {
@@ -60,6 +128,12 @@ static LogicalResult verifyMainLoop(ModuleOp module)
     CVPipeline::setFallbackAttr(module);
     return failure();
   }
+
+  if (!checkVecScopeMainLoop(module)) {
+    LDBG("[INFO]: No op beside matmul add in vector main loop.");
+    CVPipeline::setFallbackAttr(module);
+    return failure();
+  };
 
   return success();
 }
