@@ -20,30 +20,53 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
-#define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
+#include "llvm/Support/Debug.h"
 
-#include "AddDynamicCVPipeline.h"
+#include "bishengir/Dialect/Scope/IR/Scope.h"
+#include "mlir/IR/BuiltinOps.h"
+
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
-#include "third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
-#include "third_party/ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-#include "third_party/ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/DataDependencyAnalysis.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/InterCoreTransferAndSync.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/MarkMainLoop.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/PreserveControlAttrsCanonicalize.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
-#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
+
+using namespace mlir;
+using namespace triton;
+
+static constexpr const char *DEBUG_TYPE = "pre-check-scope";
+#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
+
+void PreCheckScopePass::getDependentDialects(DialectRegistry &registry) const
+{
+    registry.insert<scope::ScopeDialect>();
+}
+
+void PreCheckScopePass::runOnOperation()
+{
+    ModuleOp module = getOperation();
+    scope::ScopeOp firstScopeOp = nullptr;
+
+    module.walk([&](scope::ScopeOp scopeOp) -> WalkResult {
+        firstScopeOp = scopeOp;
+        return WalkResult::interrupt();
+    });
+
+    if (!firstScopeOp) {
+        LDBG("The scope.scope operation is not found, passed.");
+        return;
+    }
+
+    LDBG("SSBUFFER will be skipped because the scope.scope operation was found, "
+        "which indicating that it has been optimized for the Ascend platform.");
+    signalPassFailure();
+}
 
 namespace mlir {
 namespace triton {
 
-using namespace mlir;
-#define GEN_PASS_REGISTRATION
-#include "ascend/include/DynamicCVPipeline/Passes.h.inc"
+std::unique_ptr<OperationPass<ModuleOp>> createPreCheckScopePass()
+{
+    return std::make_unique<PreCheckScopePass>();
+}
 
 } // namespace triton
 } // namespace mlir
-
-#endif // TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
