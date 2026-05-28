@@ -20,30 +20,48 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
-#define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
+#include "llvm/Support/Debug.h"
 
-#include "AddDynamicCVPipeline.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/IR/BuiltinOps.h"
+
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
-#include "third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
-#include "third_party/ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-#include "third_party/ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/DataDependencyAnalysis.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/InterCoreTransferAndSync.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/MarkMainLoop.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/PreserveControlAttrsCanonicalize.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
-#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
+
+using namespace mlir;
+using namespace triton;
+
+static constexpr const char *DEBUG_TYPE = "pre-check-matmul";
+#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
+
+void PreCheckMatmul::runOnOperation()
+{
+    ModuleOp module = getOperation();
+    linalg::MatmulOp firstMatmulOp = nullptr;
+
+    module.walk([&](linalg::MatmulOp matmulOp) -> WalkResult {
+        firstMatmulOp = matmulOp;
+        return WalkResult::interrupt();
+    });
+
+    if (firstMatmulOp) {
+        LDBG("The linalg.matmul operation is found, passed.");
+        return;
+    }
+
+    LDBG("SSBUFFER will be skipped because no linalg.matmul operation was found, "
+        "which indicating that this op is a pure vector computation.");
+    signalPassFailure();
+}
 
 namespace mlir {
 namespace triton {
 
-using namespace mlir;
-#define GEN_PASS_REGISTRATION
-#include "ascend/include/DynamicCVPipeline/Passes.h.inc"
+std::unique_ptr<OperationPass<ModuleOp>> createPreCheckMatmulPass()
+{
+    return std::make_unique<PreCheckMatmul>();
+}
 
 } // namespace triton
 } // namespace mlir
-
-#endif // TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H

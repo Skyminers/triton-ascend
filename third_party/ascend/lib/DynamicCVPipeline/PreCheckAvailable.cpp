@@ -20,30 +20,55 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
-#define TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
+#include "llvm/Support/Debug.h"
 
-#include "AddDynamicCVPipeline.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
+
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
-#include "third_party/ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
-#include "third_party/ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
-#include "third_party/ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/AddBlockIdForControlOps.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/DataDependencyAnalysis.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/InterCoreTransferAndSync.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/MarkMainLoop.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/PreserveControlAttrsCanonicalize.h"
-#include "ascend/include/DynamicCVPipeline/SplitDataflow/SeparateCVScope.h"
-#include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+
+using namespace mlir;
+using namespace triton;
+
+static constexpr const char *DEBUG_TYPE = "pre-check-dynamic-cv-pipeline-available";
+#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << (X) << "\n")
+
+void PreCheckAvailablePass::runOnOperation()
+{
+    ModuleOp module = getOperation();
+
+    LDBG("Enter PreCheckAvailable pass.");
+
+    PassManager pm(&getContext(), module.getOperationName());
+
+    pm.addPass(createPreCheckScopePass());
+    pm.addPass(createPreCheckMatmulPass());
+
+    if (failed(runPipeline(pm, module))) {
+        CVPipeline::setFallbackAttr(module);
+        signalPassFailure();
+    }
+
+    LDBG("Exit PreCheckAvailable pass.");
+}
 
 namespace mlir {
 namespace triton {
 
-using namespace mlir;
-#define GEN_PASS_REGISTRATION
-#include "ascend/include/DynamicCVPipeline/Passes.h.inc"
+std::unique_ptr<OperationPass<ModuleOp>> createPreCheckAvailablePass()
+{
+    return std::make_unique<PreCheckAvailablePass>();
+}
+
+void registerPreCheckAvailablePasses()
+{
+    registerPass(createPreCheckScopePass);
+    registerPass(createPreCheckMatmulPass);
+    registerPass(createPreCheckAvailablePass);
+}
 
 } // namespace triton
 } // namespace mlir
-
-#endif // TRITON_ADAPTER_DYNAMIC_CV_PIPELINE_PASSES_H
