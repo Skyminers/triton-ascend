@@ -897,15 +897,19 @@ void InterCoreTransferAndSyncPass::analyzePipe()
         MLIRContext *ctx = op->getContext();
         if (isa<linalg::MatmulOp>(op)) {
             op->setAttr(CVPipeline::kAnalyzePipe, StringAttr::get(ctx, "pipe_m"));
+            return;
         }
         if (isa<hivm::CopyOp>(op)) {
             op->setAttr(CVPipeline::kAnalyzePipe, StringAttr::get(ctx, "pipe_mte3"));
+            return;
         }
         if (isa<hivm::FixpipeOp>(op)) {
             op->setAttr(CVPipeline::kAnalyzePipe, StringAttr::get(ctx, "pipe_fix"));
+            return;
         }
         if (isPipeV(op)) {
             op->setAttr(CVPipeline::kAnalyzePipe, StringAttr::get(ctx, "pipe_v"));
+            return;
         }
     });
 }
