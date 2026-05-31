@@ -49,6 +49,7 @@ void FlagIdReuseManager::insertRelationBetweenSetAndWait(Operation *before, Oper
         return;
     }
     
+    LOG_DEBUG("Add an edge from \n" << *before << " to \n" << *after << "\n");
     relations[before].push_back(after);
     return;
 }
@@ -79,12 +80,14 @@ DenseMap<int, int> FlagIdReuseManager::reuseInterCoreTransferFlagIds(const llvm:
     // Step 2: Remap every non-root flagId to its group representative (root).
     // The root keeps its original flagId, so the whole group converges onto one
     // existing flagId and never collides with unmerged ids.
+    DenseMap<int, int> compactedId;
+    int newFlagId = 1;
     for (auto &[flagId, _]: flagIdToOps) {
         auto root = disjointSet.findRoot(flagId);
-        if (root == flagId) {
-            continue;
+        if (!compactedId.contains(root)) {
+            compactedId[root] = newFlagId++;
         }
-        remapResult[flagId] = root;
+        remapResult[flagId] = compactedId[root];
     }
     return remapResult;
 }
@@ -110,16 +113,18 @@ void FlagIdReuseManager::preworkForAnalyze(const llvm::SmallVector<Operation *> 
 // 2. This is not a circle process. (Current scenes does not support circle, is this still necessary?)
 bool FlagIdReuseManager::checkReusable(int asIs, int toBe)
 {
+    LOG_DEBUG("Cheecking reusable for rewritting " << asIs << " to " << toBe << "\n");
     llvm::SmallSet<Operation *, CVPipeline::INIT_SIZE> visited;
     for (auto fromOp: flagIdToOps[toBe]) {
         for (auto destOp: flagIdToOps[asIs]) {
             visited.clear();
             if (!hasPath(visited, fromOp, destOp)) {
+                LOG_DEBUG("No path from\n" << *fromOp << "\nto\n" << *destOp << ", failed to reuse.\n");
                 return false;
             }
         }
     }
-
+    LOG_DEBUG("Reuse successfully.");
     return true;
 }
 

@@ -1,9 +1,9 @@
-// RUN: triton-opt --add-block-id-for-control-ops --data-dependency-analysis --inter-core-transfer-and-sync --mark-main-loop %s | FileCheck %s --implicit-check-not="flag = -1" --implicit-check-not="flag = 2"
+// RUN: triton-opt --add-block-id-for-control-ops --data-dependency-analysis --inter-core-transfer-and-sync --mark-main-loop %s | FileCheck %s --implicit-check-not="flag = -1"
 
 // The outer loop carries a value whose yield does not depend on the iter_arg, but
 // loop-carried analysis is no longer needed: loop iterations execute serially, so
 // loop(3)'s transfer is released before loop(5)'s transfer is acquired in program
-// order. Both sibling transfers reuse the same flag = 1.
+// order. Both sibling transfers reuse one common flag.
 
 module {
   func.func @flag_reuse_sibling_dead_iterarg(%arg0: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}) {
@@ -35,5 +35,6 @@ module {
 }
 
 // CHECK-LABEL: func.func @flag_reuse_sibling_dead_iterarg
-// CHECK-COUNT-12: {{flag = 1$}}
+// CHECK: {{flag = }}[[REUSED_FLAG:[0-9]+]]{{$}}
+// CHECK-COUNT-11: {{flag = }}[[REUSED_FLAG]]{{$}}
 // CHECK: return

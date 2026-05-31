@@ -1,10 +1,10 @@
-// RUN: triton-opt --add-block-id-for-control-ops --data-dependency-analysis --inter-core-transfer-and-sync --mark-main-loop %s | FileCheck %s --implicit-check-not="flag = -1" --implicit-check-not="flag = 2"
+// RUN: triton-opt --add-block-id-for-control-ops --data-dependency-analysis --inter-core-transfer-and-sync --mark-main-loop %s | FileCheck %s --implicit-check-not="flag = -1"
 
 // Same sibling-loop shape as flag_reuse_sibling_loops.mlir, with an outer loop (2)
 // that carries nothing. Loop iterations still execute serially, so loop(3)'s
 // transfer is fully released (its post-loop wait) before loop(4)'s transfer is
 // acquired (its pre-loop set) in program order. No loop-carried-dependency analysis
-// is needed: the two sibling transfers reuse the same flag = 1.
+// is needed: the two sibling transfers reuse one common flag.
 
 module {
   func.func @flag_reuse_sibling_unserialized(%arg0: memref<?xf32> {tt.divisibility = 16 : i32, tt.tensor_kind = 0 : i32}) {
@@ -34,6 +34,7 @@ module {
 }
 
 // CHECK-LABEL: func.func @flag_reuse_sibling_unserialized
-// Both sibling transfers collapse onto flag = 1 (loop iterations are serial).
-// CHECK-COUNT-12: {{flag = 1$}}
+// Both sibling transfers collapse onto one common flag (loop iterations are serial).
+// CHECK: {{flag = }}[[REUSED_FLAG:[0-9]+]]{{$}}
+// CHECK-COUNT-11: {{flag = }}[[REUSED_FLAG]]{{$}}
 // CHECK: return
