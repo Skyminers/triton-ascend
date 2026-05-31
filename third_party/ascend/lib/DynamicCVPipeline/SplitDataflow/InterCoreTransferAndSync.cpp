@@ -1151,9 +1151,11 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
     LOG_DEBUG("Completed C->V transfers and syncs.\n");
     LOG_DEBUG("=====================================================\n");
 
-    llvm::SmallVector<mlir::Operation *> analyzeFlagIdOps = insertAnalyzeFlagRelations(module, flagIdReuseManager);
-    DenseMap<int, int> remapResult = flagIdReuseManager.reuseInterCoreTransferFlagIds(analyzeFlagIdOps);
-    remapInterCoreTransferFlagIds(remapResult);
+    if (!flagManager.checkCurrentId()) {
+        llvm::SmallVector<mlir::Operation *> analyzeFlagIdOps = insertAnalyzeFlagRelations(module, flagIdReuseManager);
+        DenseMap<int, int> remapResult = flagIdReuseManager.reuseInterCoreTransferFlagIds(analyzeFlagIdOps);
+        remapInterCoreTransferFlagIds(remapResult);
+    }
 
     LOG_DEBUG("InterCoreTransferAndSyncPass success!\n");
 

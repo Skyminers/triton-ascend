@@ -34,7 +34,7 @@ namespace triton {
 class FlagIdManager {
 public:
   // Maximum flag count (hardware limitation)
-  static constexpr int MAX_FLAG_ID = 140;
+  static constexpr int MAX_FLAG_ID = 14;
   static constexpr int INVALID_FLAG_ID = -1;
 
   // Constructor: initialize with Module for scanning
@@ -45,6 +45,8 @@ public:
   // insertionPoint: the position where sync operation will be inserted, used for
   // linear comparison in reuse analysis. Can be nullptr.
   int acquireId(Operation* insertionPoint);
+
+  int checkCurrentId();
 
 private:
   // Scan existing Flag IDs
