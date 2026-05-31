@@ -45,6 +45,7 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 #include "Utils/Utils.h"
@@ -665,6 +666,10 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
             attachTransferTags(setOpForStart, startEndBlockId, "VECTOR", transferIndex);
             attachTransferTags(waitOpForEnd, startEndBlockId, "CUBE", transferIndex);
 
+            attachAnalyzeFlagIdTag(setOpForRead);
+            attachAnalyzeFlagIdTag(waitOpForRead);
+            attachAnalyzeFlagIdTag(waitOpForWrite);
+            attachAnalyzeFlagIdTag(setOpForWrite);
             attachAnalyzeFlagIdTag(setOpForStart);
             attachAnalyzeFlagIdTag(waitOpForEnd);
             flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForStart, waitOpForEnd);
@@ -700,6 +705,10 @@ void InterCoreTransferAndSyncPass::insertInterCoreSync(
             attachTransferTags(setOpForStart, startEndBlockId, "CUBE", transferIndex);
             attachTransferTags(waitOpForEnd, startEndBlockId, "VECTOR", transferIndex);
 
+            attachAnalyzeFlagIdTag(setOpForRead);
+            attachAnalyzeFlagIdTag(waitOpForRead);
+            attachAnalyzeFlagIdTag(waitOpForWrite);
+            attachAnalyzeFlagIdTag(setOpForWrite);
             attachAnalyzeFlagIdTag(setOpForStart);
             attachAnalyzeFlagIdTag(waitOpForEnd);
             flagIdReuseManager.insertRelationBetweenSetAndWait(setOpForStart, waitOpForEnd);
@@ -750,6 +759,83 @@ void InterCoreTransferAndSyncPass::insertPipeSSync(OpBuilder &builder, Operation
 
     LOG_DEBUG("[PIPE_S setOp]: " << *setOp << "\n");
     LOG_DEBUG("[PIPE_S waitOp]: " << *waitOp << "\n");
+}
+
+static bool isConcretePipe(hivm::PIPE pipe)
+{
+    return pipe != hivm::PIPE::PIPE_UNASSIGNED && pipe != hivm::PIPE::PIPE_ALL &&
+        pipe != hivm::PIPE::PIPE_NUM;
+}
+
+static std::optional<hivm::TCoreType> getAnalyzeCoreType(Operation *op)
+{
+    if (auto coreAttr = op->getAttrOfType<hivm::TCoreTypeAttr>(hivm::TCoreTypeAttr::name)) {
+        auto coreType = coreAttr.getTcoretype();
+        if (coreType == hivm::TCoreType::CUBE || coreType == hivm::TCoreType::VECTOR) {
+            return coreType;
+        }
+    }
+
+    auto coreStringAttr = op->getAttrOfType<StringAttr>(kCoreTypeAttr);
+    if (!coreStringAttr) {
+        return std::nullopt;
+    }
+    StringRef coreType = coreStringAttr.getValue();
+    if (coreType == "CUBE") {
+        return hivm::TCoreType::CUBE;
+    }
+    if (coreType == "VECTOR") {
+        return hivm::TCoreType::VECTOR;
+    }
+    return std::nullopt;
+}
+
+static std::optional<hivm::AddressSpace> getMemRefAddressSpace(Type type)
+{
+    auto memRefType = dyn_cast<MemRefType>(type);
+    if (!memRefType) {
+        return std::nullopt;
+    }
+    Attribute memorySpace = memRefType.getMemorySpace();
+    if (!memorySpace) {
+        return std::nullopt;
+    }
+    auto addressSpaceAttr = dyn_cast<hivm::AddressSpaceAttr>(memorySpace);
+    if (!addressSpaceAttr) {
+        return std::nullopt;
+    }
+    return addressSpaceAttr.getAddressSpace();
+}
+
+static std::optional<hivm::PIPE> getCopyPipeForAnalyze(hivm::CopyOp copyOp)
+{
+    if (copyOp.hasPureBufferSemantics()) {
+        return copyOp.getPipe();
+    }
+
+    auto srcAddressSpace = getMemRefAddressSpace(copyOp.getSrcOperandType());
+    auto dstAddressSpace = getMemRefAddressSpace(copyOp.getDstOperandType());
+    if (srcAddressSpace && dstAddressSpace) {
+        if (*srcAddressSpace == hivm::AddressSpace::UB && *dstAddressSpace == hivm::AddressSpace::UB) {
+            return hivm::PIPE::PIPE_V;
+        }
+        if (*srcAddressSpace == hivm::AddressSpace::L0C && *dstAddressSpace == hivm::AddressSpace::GM) {
+            return hivm::PIPE::PIPE_FIX;
+        }
+        if (*srcAddressSpace == hivm::AddressSpace::GM && *dstAddressSpace == hivm::AddressSpace::L1) {
+            return hivm::PIPE::PIPE_MTE2;
+        }
+        if (*srcAddressSpace == hivm::AddressSpace::UB && *dstAddressSpace == hivm::AddressSpace::L1) {
+            return hivm::PIPE::PIPE_MTE3;
+        }
+    }
+
+    // SplitDataflow inserts tensor-to-L1 copies before full bufferization. The
+    // sync pair for this transfer uses MTE3 on the vector side.
+    if (dstAddressSpace && *dstAddressSpace == hivm::AddressSpace::L1) {
+        return hivm::PIPE::PIPE_MTE3;
+    }
+    return std::nullopt;
 }
 
 // V->C Transfer Logic
@@ -861,50 +947,126 @@ llvm::SmallVector<mlir::Operation *> InterCoreTransferAndSyncPass::insertAnalyze
 {
     using OpVector = llvm::SmallVector<mlir::Operation *>;
     llvm::SmallDenseMap<hivm::TCoreType, llvm::SmallDenseMap<hivm::PIPE, OpVector>> sequenceOpMap;
+    llvm::SmallDenseMap<Block *, OpVector> blockSequenceOpMap;
+    llvm::DenseSet<mlir::Operation *> relationOpSet;
+    llvm::SmallVector<mlir::Operation *> relationOps;
     llvm::SmallVector<mlir::Operation *> analyzeFlagIdOps;
 
-    module.walk([&](mlir::Operation *op) {
-        if (!op->hasAttr(CVPipeline::kAnalyzeFlagId)) {
+    auto insertRelation = [&](Operation *before, Operation *after) {
+        if (!before || !after || before == after) {
             return;
         }
+        flagIdReuseManager.insertRelationBetweenSetAndWait(before, after);
+    };
 
-        hivm::TCoreType coreType;
-        hivm::PIPE pipe;
+    auto noteRelationOp = [&](Operation *op) {
+        if (!relationOpSet.insert(op).second) {
+            return;
+        }
+        relationOps.push_back(op);
+        if (Block *block = op->getBlock()) {
+            blockSequenceOpMap[block].push_back(op);
+        }
+    };
+
+    auto notePipeOp = [&](Operation *op, hivm::TCoreType coreType, hivm::PIPE pipe) {
+        if (!isConcretePipe(pipe)) {
+            return;
+        }
+        sequenceOpMap[coreType][pipe].push_back(op);
+        noteRelationOp(op);
+    };
+
+    module.walk([&](mlir::Operation *op) {
         if (auto setOp = llvm::dyn_cast<hivm::SyncBlockSetOp>(op)) {
             auto coreAttr = setOp.getTcoreType();
-            if (!coreAttr) {
-                return;
-            }
             auto pipeAttr = setOp.getTpipeAttr();
-            if (!pipeAttr) {
-                return;
+            if (coreAttr && pipeAttr) {
+                notePipeOp(op, coreAttr.getTcoretype(), pipeAttr.getPipe());
             }
-            coreType = coreAttr.getTcoretype();
-            pipe = pipeAttr.getPipe();
-        } else if (auto waitOp = llvm::dyn_cast<hivm::SyncBlockWaitOp>(op)) {
-            auto coreAttr = waitOp.getTcoreType();
-            if (!coreAttr) {
-                return;
+            if (op->hasAttr(CVPipeline::kAnalyzeFlagId)) {
+                analyzeFlagIdOps.push_back(op);
             }
-            auto pipeAttr = waitOp.getPipeAttr();
-            if (!pipeAttr) {
-                return;
-            }
-            coreType = coreAttr.getTcoretype();
-            pipe = pipeAttr.getPipe();
-        } else {
             return;
         }
 
-        sequenceOpMap[coreType][pipe].push_back(op);
-        analyzeFlagIdOps.push_back(op);
+        if (auto waitOp = llvm::dyn_cast<hivm::SyncBlockWaitOp>(op)) {
+            auto coreAttr = waitOp.getTcoreType();
+            auto pipeAttr = waitOp.getPipeAttr();
+            if (coreAttr && pipeAttr) {
+                notePipeOp(op, coreAttr.getTcoretype(), pipeAttr.getPipe());
+            }
+            if (op->hasAttr(CVPipeline::kAnalyzeFlagId)) {
+                analyzeFlagIdOps.push_back(op);
+            }
+            return;
+        }
+
+        auto coreType = getAnalyzeCoreType(op);
+        if (!coreType) {
+            return;
+        }
+
+        noteRelationOp(op);
+        if (auto pipeOp = llvm::dyn_cast<hivm::OpPipeInterface>(op)) {
+            if (auto copyOp = llvm::dyn_cast<hivm::CopyOp>(op)) {
+                if (auto pipe = getCopyPipeForAnalyze(copyOp)) {
+                    notePipeOp(op, *coreType, *pipe);
+                }
+                return;
+            }
+            if (pipeOp.isMacroOp()) {
+                notePipeOp(op, *coreType, pipeOp.getInPipe());
+                notePipeOp(op, *coreType, pipeOp.getOutPipe());
+                return;
+            }
+            notePipeOp(op, *coreType, pipeOp.getPipe());
+        }
     });
+
+    for (Operation *op : relationOps) {
+        for (Value operand : op->getOperands()) {
+            Operation *definingOp = operand.getDefiningOp();
+            if (!definingOp) {
+                if (auto blockArgument = dyn_cast<BlockArgument>(operand)) {
+                    definingOp = blockArgument.getOwner()->getParentOp();
+                }
+            }
+            if (relationOpSet.contains(definingOp)) {
+                insertRelation(definingOp, op);
+            }
+        }
+    }
+
+    auto insertNestedRegionExitRelations = [&](Operation *regionOp, Operation *afterRegionOp) {
+        for (Region &region : regionOp->getRegions()) {
+            for (Block &block : region) {
+                Operation *lastRelationOp = nullptr;
+                for (Operation &nestedOp : block) {
+                    nestedOp.walk([&](Operation *candidate) {
+                        if (relationOpSet.contains(candidate)) {
+                            lastRelationOp = candidate;
+                        }
+                    });
+                }
+                insertRelation(lastRelationOp, afterRegionOp);
+            }
+        }
+    };
+
+    for (auto &blockEntry : blockSequenceOpMap) {
+        auto &ops = blockEntry.second;
+        for (size_t i = 0; i + 1 < ops.size(); ++i) {
+            insertRelation(ops[i], ops[i + 1]);
+            insertNestedRegionExitRelations(ops[i], ops[i + 1]);
+        }
+    }
 
     for (auto &coreEntry : sequenceOpMap) {
         for (auto &pipeEntry : coreEntry.second) {
             auto &ops = pipeEntry.second;
             for (size_t i = 0; i + 1 < ops.size(); ++i) {
-                flagIdReuseManager.insertRelationBetweenSetAndWait(ops[i], ops[i + 1]);
+                insertRelation(ops[i], ops[i + 1]);
             }
         }
     }
@@ -914,12 +1076,13 @@ llvm::SmallVector<mlir::Operation *> InterCoreTransferAndSyncPass::insertAnalyze
 void InterCoreTransferAndSyncPass::remapInterCoreTransferFlagIds(
     llvm::DenseMap<int, int> &remapResult)
 {
-    if (remapResult.empty()) {
-        return;
-    }
-
     module.walk([&](mlir::Operation *op) {
         if (!llvm::isa<hivm::SyncBlockSetOp>(op) && !llvm::isa<hivm::SyncBlockWaitOp>(op)) {
+            return;
+        }
+        bool trackedForReuse = op->hasAttr(CVPipeline::kAnalyzeFlagId);
+        op->removeAttr(CVPipeline::kAnalyzeFlagId);
+        if (!trackedForReuse || remapResult.empty()) {
             return;
         }
         if (auto intAttr = op->getAttrOfType<mlir::IntegerAttr>("static_flag_id")) {

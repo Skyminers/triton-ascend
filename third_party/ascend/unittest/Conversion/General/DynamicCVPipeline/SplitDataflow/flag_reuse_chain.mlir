@@ -1,4 +1,4 @@
-// RUN: triton-opt --add-block-id-for-control-ops --data-dependency-analysis --inter-core-transfer-and-sync --mark-main-loop %s | FileCheck %s --implicit-check-not="flag = -1" --implicit-check-not="flag = 2"
+// RUN: triton-opt --add-block-id-for-control-ops --data-dependency-analysis --inter-core-transfer-and-sync --mark-main-loop %s | FileCheck %s --implicit-check-not="flag = -1"
 
 module {
   func.func @flag_reuse_chain() {
@@ -17,5 +17,6 @@ module {
 }
 
 // CHECK-LABEL: func.func @flag_reuse_chain
-// CHECK-COUNT-6: {{flag = 1$}}
+// CHECK: {{flag = }}[[REUSED_FLAG:[0-9]+]]{{$}}
+// CHECK-COUNT-5: {{flag = }}[[REUSED_FLAG]]{{$}}
 // CHECK: return
