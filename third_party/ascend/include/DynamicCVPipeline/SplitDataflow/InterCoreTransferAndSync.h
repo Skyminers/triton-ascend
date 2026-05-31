@@ -125,15 +125,19 @@ private:
     llvm::StringRef consTag, int transferIndex);
   mlir::Operation *insertVectorToCubeTransfer(mlir::OpBuilder &builder, mlir::Value srcValue,
     mlir::Value normalizedValue, mlir::Operation *vectorEndOp, mlir::Operation *cubeStartOp, mlir::Location loc,
-    int transferIndex, int iniConsumerId);
+    int transferIndex, int iniConsumerId, FlagIdReuseManager &flagIdReuseManager);
   mlir::Operation *insertCubeToVectorTransfer(mlir::OpBuilder &builder, mlir::Value srcValue,
     mlir::Operation *cubeEndOp, mlir::Operation *vectorStartOp, mlir::Location loc, int transferIndex,
-    int iniConsumerId);
+    int iniConsumerId, FlagIdReuseManager &flagIdReuseManager);
   void insertInterCoreSync(mlir::OpBuilder &builder, mlir::Operation *transferOp, mlir::Operation *consumerStartOp,
     mlir::Operation *consumerEndOp, int flag, mlir::Location loc, int transferIndex, FlagIdReuseManager &flagIdReuseManager);
   void insertPipeSSync(mlir::OpBuilder &builder, mlir::Operation *producerOp, mlir::Operation *consumerOp, int flag,
     mlir::Location loc, bool isCubeToVector);
-  llvm::SmallVector<mlir::Operation *> insertAnalyzeFlagRelations(mlir::ModuleOp module, FlagIdReuseManager &flagIdReuseManager);
+  bool isPipeV(mlir::Operation *op);
+  void analyzePipe();
+  hivm::PIPE getPipe(mlir::Operation *op);
+  llvm::SmallVector<mlir::Operation *> insertPipeRelations(
+    mlir::ModuleOp module, FlagIdReuseManager &flagIdReuseManager);
   void remapInterCoreTransferFlagIds(llvm::DenseMap<int, int> &remapResult);
 };
 

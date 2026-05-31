@@ -11,7 +11,8 @@ module {
     %exp0 = math.exp %mat {ssbuffer.block_id = 2 : i32, ssbuffer.core_type = "VECTOR"} : tensor<32x32xf32>
     %empty_0 = tensor.empty() {ssbuffer.block_id = 3 : i32, ssbuffer.core_type = "CUBE"} : tensor<32x32xf32>
     %tr = linalg.transpose ins(%exp0 : tensor<32x32xf32>) outs(%empty_0 : tensor<32x32xf32>) permutation = [1, 0] {ssbuffer.block_id = 3 : i32, ssbuffer.core_type = "CUBE"}
-    %exp1 = math.exp %tr {ssbuffer.block_id = 4 : i32, ssbuffer.core_type = "VECTOR"} : tensor<32x32xf32>
+    %mat_1 = linalg.matmul {ssbuffer.block_id = 3 : i32, ssbuffer.core_type = "CUBE"} ins(%tr, %tr : tensor<32x32xf32>, tensor<32x32xf32>) outs(%fill : tensor<32x32xf32>) -> tensor<32x32xf32>
+    %exp1 = math.exp %mat_1 {ssbuffer.block_id = 4 : i32, ssbuffer.core_type = "VECTOR"} : tensor<32x32xf32>
     return
   }
 }
