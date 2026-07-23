@@ -244,6 +244,10 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         if _load_val is not None:
             ascend.passes.ttir.set_buffer_count(mod, "LOAD", _load_val)
 
+        _ub_budget = metadata.get("ub_budget")
+        if _ub_budget is not None:
+            ascend.passes.ttir.set_ub_budget(mod, _ub_budget)
+
         pm.run(mod)
         _adjust_metadata_by_module_result(mod, metadata, opt,
                                           enable_mixed_cv=enable_mixed_cv,
@@ -998,6 +1002,12 @@ class NPUOptions:
     intra_cache_num: int = None
     inter_cache_num: int = None
     load_cache_num: int = None
+    # Per-load GM-load multi-buffer UB budget, as a percentage of the physical
+    # UB (248KB) base size. May exceed 100 since PlanMemory reuses UB
+    # downstream. Setting it enables the per-load policy (L1 loads are then
+    # filled to the full physical L1, which has no reuse and needs no tuning).
+    # None leaves the global LoadStore behavior unchanged.
+    ub_budget: int = None
 
     stream: int = None
     parallel_mode: str = "simd"

@@ -24,8 +24,11 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/Debug.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/MultiBufferOverride.h"
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadPass.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AsyncLoadHoistingPass.h"
+#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/GMLoadMultiBufferPolicyPass.h"
 
 static constexpr const char *DEBUG_TYPE = "separate-memory-from-compute";
 #define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
@@ -34,14 +37,33 @@ static constexpr const char *DEBUG_TYPE = "separate-memory-from-compute";
 using namespace mlir;
 using namespace triton;
 
+// The per-load budget policy is active when the user opted into it (budget
+// attributes present) or already pinned some load via compile_hint. In those
+// cases the global LoadStore count may still be 1 while individual loads want
+// multi-buffering, so the depth<=1 short-circuit must not fire.
+static bool hasPerLoadMultiBufferRequest(ModuleOp module)
+{
+  if (module->hasAttr(CVPipeline::kUbBudget))
+    return true;
+  bool found = false;
+  module.walk([&](memref::AllocOp alloc) {
+    if (gmload::getMultiBufferOverride(alloc)) {
+      found = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return found;
+}
+
 void SeparateMemoryFromComputePass::runOnOperation()
 {
   ModuleOp module = getOperation();
 
   int depth = BufferCountManager(module).getBufferCountByType(BufferCountManager::DepType::LoadStore);
 
-  if (depth <= 1) {
-    LDBG("Buffer depth <= 1, skip multi-buffer transformation");
+  if (depth <= 1 && !hasPerLoadMultiBufferRequest(module)) {
+    LDBG("Buffer depth <= 1 and no per-load request, skip multi-buffer transformation");
     return;
   }
 
@@ -51,7 +73,10 @@ void SeparateMemoryFromComputePass::runOnOperation()
   // Step 1: Hoist memory operations out of compute blocks
   pm.addPass(createAsyncLoadHoistingPass());
 
-  // Step 2: Apply multi-buffering to memory operations
+  // Step 2: Decide the per-load multi-buffer depth (UB/L1 budget policy)
+  pm.addPass(createGMLoadMultiBufferPolicyPass());
+
+  // Step 3: Apply multi-buffering to memory operations
   pm.addPass(createAddMultiBufferToGMLoadPass());
 
   if (failed(runPipeline(pm, module))) {

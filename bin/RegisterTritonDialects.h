@@ -10,6 +10,7 @@
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AsyncLoadHoistingPass.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadPass.h"
+#include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/GMLoadMultiBufferPolicyPass.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferOuterScope.h"
 #include "ascend/include/DynamicCVPipeline/AllocMultiCache/AddMultiBufferInnerScope.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
@@ -119,6 +120,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerRefineArgsBlockIdPasses();
   mlir::triton::registerAsyncLoadHoistingPasses();
   mlir::triton::registerAddMultiBufferToGMLoadPasses();
+  mlir::triton::registerGMLoadMultiBufferPolicyPass();
 
 
   // TODO: register Triton & TritonGPU passes

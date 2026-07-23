@@ -49,6 +49,14 @@ inline constexpr llvm::StringLiteral kIntraBuffer = "ssbuffer.intra_buffer";
 inline constexpr llvm::StringLiteral kIntraBufCount = "ssbuffer.intra_buf_count";
 inline constexpr llvm::StringLiteral kInterCoreBufCount = "ssbuffer.inter_core_buf_count";
 inline constexpr llvm::StringLiteral kLoadStoreBufCount = "ssbuffer.load_store_buf_count";
+// Per-load GM-load multi-buffer budget policy (see GMLoadMultiBufferPolicyPass).
+// The UB budget is a module-level percentage of the physical UB size; it may
+// exceed 100% because PlanMemory reuses UB downstream. L1 has no reuse, so its
+// budget is always the full physical size and is not user-tunable.
+inline constexpr llvm::StringLiteral kUbBudget = "ssbuffer.ub_budget";
+// Per-buffer multi-buffer depth mark consumed by AddMultiBufferToGMLoad and the
+// cost model. Set either by the policy pass or by the user via compile_hint.
+inline constexpr llvm::StringLiteral kMultiBuffer = "hivm.multi_buffer";
 inline constexpr llvm::StringLiteral kAnalyzeFlagId = "ssbuffer.analyze_flag_id";
 inline constexpr llvm::StringLiteral kLoopCarriedL0C = "ssbuffer.loop_carried_l0c";
 inline constexpr llvm::StringLiteral kCrossDeps = "ssbuffer.crossDeps";

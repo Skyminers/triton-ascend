@@ -23,10 +23,23 @@
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadInternal.h"
 #include "ascend/include/DynamicCVPipeline/SeparateMemoryFromCompute/AddMultiBufferToGMLoadPass.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
+#include "ascend/include/DynamicCVPipeline/Common/MultiBufferOverride.h"
 
 using namespace mlir;
 using namespace triton;
 using namespace gmload;
+
+// A group's depth is the max per-load override among its loads (set by
+// GMLoadMultiBufferPolicyPass or the user via compile_hint), or the global
+// LoadStore default when none of them was overridden.
+static int resolveGroupDepth(const gmload::LoadGroup &group, int globalDepth)
+{
+    int depth = 0;
+    for (const gmload::MarkedLoad &load : group.loads)
+        if (auto d = gmload::getMultiBufferOverride(load.allocOp))
+            depth = std::max(depth, *d);
+    return depth > 0 ? depth : globalDepth;
+}
 
 // ============================================================================
 // Step functions
@@ -47,17 +60,24 @@ void AddMultiBufferToGMLoadPass::collectAndGroupMarkedOps()
     // Group by enclosing scf::ForOp.
     groupByEnclosingForOp(markedOps_, contexts_);
 
-    // Apply depth policy: skip loops whose compile-time trip count is too small
-    // to benefit, then record the slot count on each group.
-    int depth = BufferCountManager(module).getBufferCountByType(BufferCountManager::DepType::LoadStore);
-    llvm::erase_if(contexts_, [depth](const ForBufferCtx &context) {
-        if (auto tripCount = getConstantTripCount(context.forOp))
-            return *tripCount <= depth;
-        return false;
-    });
+    // Apply depth policy: each group takes its per-load `hivm.multi_buffer`
+    // override (from GMLoadMultiBufferPolicyPass or compile_hint) if present,
+    // else the global LoadStore default.
+    int globalDepth = BufferCountManager(module).getBufferCountByType(BufferCountManager::DepType::LoadStore);
     for (auto &context : contexts_)
         for (auto &group : context.groups)
-            group.depth = depth;
+            group.depth = resolveGroupDepth(group, globalDepth);
+
+    // Skip loops whose compile-time trip count is too small to benefit from
+    // their deepest group.
+    llvm::erase_if(contexts_, [](const ForBufferCtx &context) {
+        int maxDepth = 0;
+        for (const auto &group : context.groups)
+            maxDepth = std::max(maxDepth, group.depth);
+        if (auto tripCount = getConstantTripCount(context.forOp))
+            return *tripCount <= maxDepth;
+        return false;
+    });
 
     if (contexts_.empty())
         LOG_DEBUG("No bufferable loops found\n");

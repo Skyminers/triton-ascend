@@ -111,7 +111,8 @@ void captureRegionFreeVars(llvm::SetVector<Operation *> &visited, SmallVectorImp
                            Block *scopeBlock);
 SmallVector<Operation *> computeLoadChain(Operation *markedOp, Block *scopeBlock);
 memref::AllocOp findBackingAlloc(Operation *markedOp, ArrayRef<Operation *> chain);
-SmallVector<MarkedLoad> collectMarkedOps(ModuleOp module);
+// collectMarkedOps is declared in AddMultiBufferToGMLoadTypes.h (included above)
+// so TUs that don't want this header's DEBUG_TYPE/LOG_DEBUG macros can share it.
 std::optional<int64_t> getConstantTripCount(scf::ForOp forOp);
 void groupByEnclosingForOp(SmallVector<MarkedLoad> &markedOps, SmallVectorImpl<ForBufferCtx> &contexts);
 void collectChainAndMarkedOps(const SmallVector<MarkedLoad> &loads, llvm::DenseSet<Operation *> &allChainOps,

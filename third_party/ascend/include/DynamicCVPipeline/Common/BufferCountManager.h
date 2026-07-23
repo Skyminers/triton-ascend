@@ -34,6 +34,10 @@ namespace triton {
 
 class BufferCountManager {
 public:
+    // LoadStore is the global GM-load buffer depth fallback: AddMultiBufferToGMLoad
+    // uses it only for loads that carry no per-load `hivm.multi_buffer` override
+    // (see gmload::getMultiBufferOverride / GMLoadMultiBufferPolicyPass). It is no
+    // longer the actual depth for every GM load once that policy is enabled.
     enum class DepType { IntraCore, InterCore, LoadStore };
 
     explicit BufferCountManager(Operation *root);

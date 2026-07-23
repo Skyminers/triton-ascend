@@ -38,6 +38,14 @@ struct MarkedLoad {
     mlir::memref::AllocOp allocOp;
 };
 
+// Enumerates all GM-load-bufferable ops in the module along with the
+// topo-sorted dependency chain needed to reproduce each one. Declared here
+// (rather than pulled in via AddMultiBufferToGMLoadInternal.h) so any TU that
+// only needs this one entry point, and not that header's file-scope
+// DEBUG_TYPE/LOG_DEBUG macros, can share a single declaration. Defined in
+// DependencyAnalysis.cpp.
+llvm::SmallVector<MarkedLoad> collectMarkedOps(mlir::ModuleOp module);
+
 // Each marked load gets its own independent LoadGroup with its own
 // producer/consumer counter pair.
 struct LoadGroup {

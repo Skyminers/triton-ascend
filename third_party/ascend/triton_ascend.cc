@@ -388,6 +388,11 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     }
   });
 
+  m.def("set_ub_budget", [](mlir::ModuleOp &module, int percent) {
+    OpBuilder builder(module.getContext());
+    module->setAttr(CVPipeline::kUbBudget, builder.getI32IntegerAttr(percent));
+  });
+
   m.def("set_enable_cube_block_merge", [](bool enable) {
     mlir::CVPipeline::setEnableCubeBlockMerge(enable);
   });
