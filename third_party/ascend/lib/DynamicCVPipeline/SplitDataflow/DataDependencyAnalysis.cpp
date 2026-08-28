@@ -320,6 +320,8 @@ void DataDependencyAnalysisPass::createBlockInfoMap(DataDependencyInfo &info) {
   llvm::SmallVector<mlir::Operation *> currentOps;
 
   module.walk([&](mlir::Operation *op) {
+    if (restrictToMainLoop && !CVPipeline::getEnclosingMainLoop(op))
+      return;
     auto opBlockIdOpt = CVPipeline::getOpBlockId(op);
     if (opBlockIdOpt) {
       int opBlockId = *opBlockIdOpt;
@@ -391,6 +393,8 @@ DataDependencyAnalysisPass::collectDiffCoreTypeUsers(
   llvm::SmallVector<mlir::Operation *> diffUsers;
 
   for (mlir::Operation *user : iterArg.getUsers()) {
+    if (restrictToMainLoop && !CVPipeline::getEnclosingMainLoop(user))
+      continue;
     if (isa<scf::YieldOp>(user)) {
       continue;
     }
@@ -516,6 +520,10 @@ void DataDependencyAnalysisPass::recordInitValueDeps(
   auto &c2vDependencies = info.getC2VDependencies();
 
   Operation *initDefOp = initValue.getDefiningOp();
+  if (restrictToMainLoop && initDefOp &&
+      !CVPipeline::areInSameMainLoop(initDefOp, loopOp.getOperation())) {
+    return;
+  }
   auto initDefBlockIdOpt = CVPipeline::getOpBlockId(initDefOp);
   if (!initDefBlockIdOpt) {
     LOG_DEBUG("Warning: Init defining op block ID not found.\n");
@@ -589,6 +597,10 @@ void DataDependencyAnalysisPass::processIterArgDependencies() {
   for (mlir::LoopLikeOpInterface loopOp : loopOps) {
     Operation *loopOperation = loopOp.getOperation();
     if (!isa<scf::ForOp, scf::WhileOp>(loopOperation)) {
+      continue;
+    }
+    if (restrictToMainLoop &&
+        !CVPipeline::getEnclosingMainLoop(loopOperation)) {
       continue;
     }
 
@@ -721,6 +733,10 @@ void DataDependencyAnalysisPass::analyzeExternalInputs(
       }
 
       Operation *defOp = input.getDefiningOp();
+      if (restrictToMainLoop && defOp &&
+          !CVPipeline::areInSameMainLoop(defOp, blockInfo.Operations[0])) {
+        continue;
+      }
       auto defReuslt = dyn_cast<mlir::OpResult>(input);
       auto coreType = getCoreTypeWithIndex(
           defOp, defReuslt ? defReuslt.getResultNumber() : 0);
@@ -809,6 +825,10 @@ void DataDependencyAnalysisPass::analyzeExternalOutputs(
       bool isAllTranspoesd = isAllTransposedInVector(output);
 
       for (mlir::Operation *user : output.getUsers()) {
+        if (restrictToMainLoop &&
+            !CVPipeline::areInSameMainLoop(output.getDefiningOp(), user)) {
+          continue;
+        }
         int outputIndex = 0;
         if (isControlFlowOp(user)) {
           for (unsigned i = 0; i < user->getNumOperands(); ++i) {
@@ -882,6 +902,9 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
   MemoryDependenceGraph memDepGraph(module, aliasAnalysis);
 
   auto walkResult = module.walk([&](mlir::Operation *op) -> WalkResult {
+    if (restrictToMainLoop && !CVPipeline::getEnclosingMainLoop(op)) {
+      return WalkResult::advance();
+    }
     if (op->getNumRegions() > 0) {
       return WalkResult::advance();
     }
@@ -905,6 +928,10 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
           return WalkResult::advance();
         }
         for (mlir::Operation *realPredOp : realdeps) {
+          if (restrictToMainLoop &&
+              !CVPipeline::areInSameMainLoop(realPredOp, op)) {
+            continue;
+          }
           if (isa<annotation::MarkOp, gpu::BarrierOp>(realPredOp)) {
             continue;
           }
@@ -935,6 +962,10 @@ void DataDependencyAnalysisPass::analyzeMemoryEffect(DataDependencyInfo &info) {
         continue;
       }
       auto predBlockIdOpt = CVPipeline::getOpBlockId(predOp);
+      if (restrictToMainLoop &&
+          !CVPipeline::areInSameMainLoop(predOp, op)) {
+        continue;
+      }
       llvm::StringRef predCoreType = getSsbufferCoreType(predOp);
       if (!predBlockIdOpt || predCoreType == currCoreType ||
           predCoreType.empty()) {
@@ -1073,6 +1104,12 @@ void DataDependencyAnalysisPass::runOnOperation() {
   if (CVPipeline::hasFallbackAttr(module)) {
     return;
   }
+
+  restrictToMainLoop = false;
+  module.walk([&](Operation *op) {
+    if (CVPipeline::isMainLoopOp(op))
+      restrictToMainLoop = true;
+  });
 
   auto &info = getAnalysis<DataDependencyInfo>();
 

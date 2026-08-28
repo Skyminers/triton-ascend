@@ -38,6 +38,7 @@ public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MarkMainLoopPass)
 
   MarkMainLoopPass() = default;
+  explicit MarkMainLoopPass(bool explicitOnly) : explicitOnly(explicitOnly) {}
 
   // Run the pass
   void runOnOperation() override;
@@ -53,9 +54,14 @@ public:
   ::llvm::StringRef getName() const override { return "MarkMainLoopPass"; }
 
 private:
+  // The early SplitDataflow invocation only resolves a frontend hint. The
+  // later invocation may use the legacy Fixpipe/Copy heuristic when no hint
+  // was supplied.
+  bool explicitOnly = false;
 };
 
-std::unique_ptr<OperationPass<ModuleOp>> createMarkMainLoopPass();
+std::unique_ptr<OperationPass<ModuleOp>>
+createMarkMainLoopPass(bool explicitOnly = false);
 
 void registerMarkMainLoopPasses();
 

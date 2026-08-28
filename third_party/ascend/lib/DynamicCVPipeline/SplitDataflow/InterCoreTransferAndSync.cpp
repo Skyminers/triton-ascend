@@ -512,6 +512,12 @@ mlir::Operation *InterCoreTransferAndSyncPass::annotateTightlyCoupledBuffer(
 Operation *
 InterCoreTransferAndSyncPass::findMainLoopforTransfer(Operation *endOp,
                                                       Operation *startOp) {
+  if (restrictToMainLoop) {
+    Operation *endMainLoop = CVPipeline::getEnclosingMainLoop(endOp);
+    Operation *startMainLoop = CVPipeline::getEnclosingMainLoop(startOp);
+    return endMainLoop && endMainLoop == startMainLoop ? endMainLoop : nullptr;
+  }
+
   Operation *lca = endOp->getParentOp();
   if (lca != startOp->getParentOp()) {
     LOG_DEBUG("startOp: " << *startOp << " and endOp: " << *endOp
@@ -527,6 +533,24 @@ InterCoreTransferAndSyncPass::findMainLoopforTransfer(Operation *endOp,
     current = current->getParentOp();
   }
   return nullptr;
+}
+
+bool InterCoreTransferAndSyncPass::isDependencyInSelectedMainLoop(
+    const DependencyInfo &dep) {
+  if (!restrictToMainLoop)
+    return true;
+
+  Operation *producer = dep.predOp;
+  Operation *consumer = dep.nextOp;
+  if (!producer) {
+    auto [start, end] = getBlockStartEnd(dep.iniProducerBlockId, module);
+    producer = end ? end : start;
+  }
+  if (!consumer) {
+    auto [start, end] = getBlockStartEnd(dep.iniConsumerBlockId, module);
+    consumer = start ? start : end;
+  }
+  return CVPipeline::areInSameMainLoop(producer, consumer);
 }
 
 std::pair<Operation *, Operation *>
@@ -1187,6 +1211,9 @@ void InterCoreTransferAndSyncPass::removeVectorPseudoOps() {
             "ssbuffer.add_from_matmul)...\n");
 
   module.walk([&](Operation *op) {
+    if (restrictToMainLoop && !CVPipeline::getEnclosingMainLoop(op)) {
+      return;
+    }
     if (!isa<arith::AddFOp, arith::AddIOp>(op)) {
       return;
     }
@@ -1225,6 +1252,9 @@ void InterCoreTransferAndSyncPass::processCubeToVectorDirectStoreSync(
   LOG_DEBUG("Processing cube-to-vector-direct-store sync pattern...\n");
 
   module.walk([&](Operation *op) {
+    if (restrictToMainLoop && !CVPipeline::getEnclosingMainLoop(op)) {
+      return;
+    }
     if (!isa<scf::ForOp, scf::WhileOp, scf::IfOp>(op)) {
       return;
     }
@@ -1868,6 +1898,15 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
 
   llvm::SmallVector<DependencyInfo> &V2CDependencies =
       info.getV2CDependencies();
+  auto keepSelectedDependencies = [&](auto &dependencies) {
+    dependencies.erase(
+        std::remove_if(dependencies.begin(), dependencies.end(),
+                       [&](const DependencyInfo &dep) {
+                         return !isDependencyInSelectedMainLoop(dep);
+                       }),
+        dependencies.end());
+  };
+  keepSelectedDependencies(V2CDependencies);
   sortDependencies(V2CDependencies, module);
   LOG_DEBUG("[DEBUG] V2CDependencies size: " << V2CDependencies.size() << "\n");
   for (size_t i = 0; i < V2CDependencies.size(); ++i) {
@@ -1903,6 +1942,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
 
   llvm::SmallVector<DependencyInfo> &C2VDependencies =
       info.getC2VDependencies();
+  keepSelectedDependencies(C2VDependencies);
   sortDependencies(C2VDependencies, module);
   LOG_DEBUG("[DEBUG] C2VDependencies size: " << C2VDependencies.size() << "\n");
   // Step 2: Handle C->V dependencies
@@ -1923,6 +1963,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
   // Step 3: Handle C->C dependencies (fixpipe L0C to L1)
   llvm::SmallVector<DependencyInfo> &C2CDependencies =
       info.getC2CDependencies();
+  keepSelectedDependencies(C2CDependencies);
   sortDependencies(C2CDependencies, module);
   LOG_DEBUG("[DEBUG] C2CDependencies size: " << C2CDependencies.size() << "\n");
   for (auto &dep : C2CDependencies) {
@@ -1945,6 +1986,7 @@ LogicalResult InterCoreTransferAndSyncPass::processDependencies(
 
   llvm::SmallVector<DependencyInfo> &memDependencies =
       info.getMemoryDependencies();
+  keepSelectedDependencies(memDependencies);
   LOG_DEBUG("[DEBUG] MemoryDependencies size: " << memDependencies.size()
                                                 << "\n");
 
@@ -2001,6 +2043,12 @@ void InterCoreTransferAndSyncPass::runOnOperation() {
   if (CVPipeline::hasFallbackAttr(module)) {
     return;
   }
+
+  restrictToMainLoop = false;
+  module.walk([&](Operation *op) {
+    if (CVPipeline::isMainLoopOp(op))
+      restrictToMainLoop = true;
+  });
 
   // Phase 1: Initialize FlagIdManager as local variable
   FlagIdManager flagManager(module);

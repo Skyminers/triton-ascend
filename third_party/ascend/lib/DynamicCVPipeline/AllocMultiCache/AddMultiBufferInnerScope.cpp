@@ -98,11 +98,10 @@ static std::optional<int64_t> getOutermostSsbufferId(Operation *op) {
     if (current->hasAttr(kMainLoop))
       return result.has_value() ? result : -1;
 
-    if (current->getNumRegions() >= 2)
-      return getOpBlockId(current);
-
-    // Otherwise remember the deepest id seen; the parent walk will
-    // overwrite it if a closer-to-boundary op carries one.
+    // Remember the deepest id seen; the parent walk overwrites it if a
+    // closer-to-main-loop op carries one. Do not stop at a nested multi-region
+    // op: with an explicitly selected outer main loop there may still be an
+    // unmarked loop between that op and the selected boundary.
     if (auto curId = getOpBlockId(current); curId.has_value())
       result = curId;
   }
@@ -235,7 +234,7 @@ static Operation *findNestedMainloop(const MainLoop &loop) {
 }
 
 bool isInsideMainLoopForOp(Operation *op) {
-  return isMainLoopOp(op->getParentOp());
+  return getEnclosingMainLoop(op) != nullptr;
 }
 
 bool isInsideMainLoopForOpTraverse(Operation *op) {
@@ -530,9 +529,8 @@ collectScalarDeps(DenseMap<Value, SmallVector<Value>> &depValueMap,
         // tensor::EmptyOp should be treated like scalar, add dep_mark
         if (!isa<tensor::EmptyOp>(depDefinedOp))
           continue;
-        // Check if definingOp's parentOp is a main_loop forOp
-        auto *parentOp = depDefinedOp->getParentOp();
-        if (!parentOp || !parentOp->hasAttr(kMainLoop))
+        // The selected main loop may be an outer ancestor of a nested loop.
+        if (!getEnclosingMainLoop(depDefinedOp))
           continue;
       }
 

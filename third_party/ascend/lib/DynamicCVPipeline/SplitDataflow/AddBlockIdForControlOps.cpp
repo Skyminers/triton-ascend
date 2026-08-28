@@ -48,8 +48,21 @@ void AddBlockIdForControlOpsPass::runOnOperation() {
 
   LOG_DEBUG("maxBlockId: " << maxBlockId << "\n");
 
+  bool hasSelectedMainLoop = false;
+  module.walk([&](Operation *op) {
+    if (CVPipeline::isMainLoopOp(op))
+      hasSelectedMainLoop = true;
+  });
+
   // Step 2: add block_id for control flow ops
   module.walk([&](Operation *op) {
+    // With an explicit frontend selection, control flow outside that loop is
+    // not part of the dynamic pipeline. Kernels without an early selection
+    // retain the legacy whole-module behavior.
+    if (hasSelectedMainLoop && !CVPipeline::getEnclosingMainLoop(op)) {
+      return;
+    }
+
     // skip op with block_id
     if (op->getAttrOfType<IntegerAttr>(CVPipeline::kBlockId)) {
       return;

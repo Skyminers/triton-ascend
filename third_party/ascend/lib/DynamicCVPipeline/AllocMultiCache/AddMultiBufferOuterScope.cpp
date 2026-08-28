@@ -76,13 +76,13 @@ static bool isInVectorScope(Operation *op) {
 
 // --- main_loop attribute helpers ---
 
-/// Check if a sync op's direct parent is a main_loop op (forOp / whileOp
-/// carrying the ssbuffer.main_loop attribute)
-static bool parentOpHasMainLoopAttr(Operation *syncOp) {
-  if (!syncOp) {
+/// Check if an op is contained by a selected main_loop. Transfer ops may live
+/// in a nested loop even when the frontend selected an outer loop.
+static bool isInsideMainLoop(Operation *op) {
+  if (!op) {
     return false;
   }
-  return CVPipeline::isMainLoopOp(syncOp->getParentOp());
+  return CVPipeline::getEnclosingMainLoop(op) != nullptr;
 }
 
 // --- Operation search helpers ---
@@ -313,7 +313,7 @@ static int tagLoadStoreOpsWithCrossDeps(
   return 0;
 }
 
-/// Collect extra sync ops (parent has no main_loop), paired by flag
+/// Collect extra sync ops outside the selected main_loop, paired by flag.
 static int collectExtraSync(const SmallVector<Operation *> &ops,
                             int originalFlag, ExtraSyncInfo &info) {
   SmallVector<Operation *> extraSets;
@@ -324,7 +324,7 @@ static int collectExtraSync(const SmallVector<Operation *> &ops,
       continue;
     }
 
-    bool hasMainLoop = parentOpHasMainLoopAttr(op);
+    bool hasMainLoop = isInsideMainLoop(op);
     LDBG("sync op: flag=" << getFlagFromSyncOp(op)
                           << ", block_id=" << getBlockId(op)
                           << ", parentHasMainLoop=" << hasMainLoop);
@@ -366,7 +366,7 @@ static int collectExtraSync(const SmallVector<Operation *> &ops,
   return 0;
 }
 
-/// Collect transfer chain ops (parent has main_loop)
+/// Collect transfer chain ops inside the selected main_loop.
 static int collectTransferChains(const SmallVector<Operation *> &ops,
                                  int originalFlag, TransferChainInfo &info) {
   for (Operation *op : ops) {
@@ -374,7 +374,7 @@ static int collectTransferChains(const SmallVector<Operation *> &ops,
         !op->getBlock()) {
       continue;
     }
-    if (!parentOpHasMainLoopAttr(op)) {
+    if (!isInsideMainLoop(op)) {
       continue;
     }
 
@@ -435,7 +435,7 @@ static int buildTransferGroupData(int tid, const SmallVector<Operation *> &ops,
     }
   }
 
-  // 2. Collect extra sync (parent has no main_loop)
+  // 2. Collect extra sync outside the selected main_loop
   ExtraSyncInfo extraInfo;
   if (collectExtraSync(ops, info.originalFlag, extraInfo)) {
     return -1;
@@ -450,7 +450,7 @@ static int buildTransferGroupData(int tid, const SmallVector<Operation *> &ops,
     LDBG("Extra sync: not found");
   }
 
-  // 3. Collect transfer chain (parent has main_loop)
+  // 3. Collect transfer chain inside the selected main_loop
   TransferChainInfo chainInfo;
   if (collectTransferChains(ops, info.originalFlag, chainInfo)) {
     return -1;
@@ -1210,16 +1210,19 @@ static int processTransferChain(TransferOpChain &chain, Value cond,
 
 /// Create polling condition and builder for a loop op (ForOp or WhileOp).
 /// Returns the condition Value; `builderOut` is set to the insertion point
-/// for subsequent wrapping ops (before the loop terminator).
+/// next to `waitOp` for subsequent wrapping ops.
 static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
                                 OpBuilder &builderOut) {
   int bid = getBlockId(waitOp);
   int tid = getTransferId(waitOp);
 
   if (auto forOp = dyn_cast<scf::ForOp>(loopOp)) {
-    OpBuilder condBuilder(forOp.getBody(), Block::iterator(waitOp));
+    // The selected main loop may be an ancestor rather than waitOp's direct
+    // parent. Materialize the condition next to waitOp, where the selected
+    // loop's induction variable is still in scope.
+    OpBuilder condBuilder(waitOp);
     Value cond = createPollingCondition(forOp, condBuilder, bid, tid);
-    builderOut.setInsertionPoint(forOp.getBody()->getTerminator());
+    builderOut.setInsertionPoint(waitOp);
     return cond;
   }
 
@@ -1228,8 +1231,8 @@ static Value prepareLoopPolling(Operation *loopOp, Operation *waitOp,
     // (counter % 2) == 0
     Block &after = whileOp.getAfter().front();
     Value counter = after.getArgument(after.getNumArguments() - 1);
-    builderOut.setInsertionPoint(after.getTerminator());
-    OpBuilder condBuilder(builderOut);
+    builderOut.setInsertionPoint(waitOp);
+    OpBuilder condBuilder(waitOp);
     Value c2 =
         condBuilder.create<arith::ConstantIntOp>(whileOp.getLoc(), 2, 32);
     Value rem =
@@ -1248,8 +1251,12 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
   for (auto &p : groups) {
     TransferGroupInfo &g = p.second;
 
-    // Get sender's loop op (ForOp or WhileOp)
-    Operation *senderWaitParent = g.senderChain.waitOp->getParentOp();
+    // Use the selected main loop, not the nearest nested loop containing the
+    // transfer chain.
+    Operation *senderWaitParent =
+        CVPipeline::getEnclosingMainLoop(g.senderChain.waitOp);
+    if (!senderWaitParent)
+      return -1;
 
     // Prepare polling condition and builder for sender loop
     OpBuilder senderBuilder(senderWaitParent->getContext());
@@ -1265,25 +1272,21 @@ static int addPollingControlFlow(DenseMap<int, TransferGroupInfo> &groups) {
 
     // Process receiver chain (may use different loop op) (isProducer=false)
     if (g.receiverChain.waitOp) {
-      Operation *receiverWaitParent = g.receiverChain.waitOp->getParentOp();
+      Operation *receiverWaitParent =
+          CVPipeline::getEnclosingMainLoop(g.receiverChain.waitOp);
+      if (!receiverWaitParent)
+        return -1;
 
-      if (receiverWaitParent == senderWaitParent) {
-        // Use the same cond and builder
-        if (processTransferChain(g.receiverChain, senderCond,
-                                 g.receiverInputBuffer, g.receiverOutputBuffer,
-                                 g.outputFlag, false, senderBuilder) != 0) {
-          return -1;
-        }
-      } else {
-        // Receiver uses a different loop op, prepare new cond and builder
-        OpBuilder receiverBuilder(receiverWaitParent->getContext());
-        Value receiverCond = prepareLoopPolling(
-            receiverWaitParent, g.receiverChain.waitOp, receiverBuilder);
-        if (processTransferChain(g.receiverChain, receiverCond,
-                                 g.receiverInputBuffer, g.receiverOutputBuffer,
-                                 g.outputFlag, false, receiverBuilder) != 0) {
-          return -1;
-        }
+      // Materialize the receiver condition at its own wait. Even when both
+      // chains belong to the same selected main loop, they may be in sibling
+      // nested regions where the sender condition does not dominate.
+      OpBuilder receiverBuilder(receiverWaitParent->getContext());
+      Value receiverCond = prepareLoopPolling(
+          receiverWaitParent, g.receiverChain.waitOp, receiverBuilder);
+      if (processTransferChain(g.receiverChain, receiverCond,
+                               g.receiverInputBuffer, g.receiverOutputBuffer,
+                               g.outputFlag, false, receiverBuilder) != 0) {
+        return -1;
       }
     }
   }

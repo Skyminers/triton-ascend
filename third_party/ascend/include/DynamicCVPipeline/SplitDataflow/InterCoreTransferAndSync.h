@@ -103,6 +103,7 @@ private:
   int transferIndex = 0;
   int markAllocIndex = 0;
   int intraDepsGroupId = 0;
+  bool restrictToMainLoop = false;
 
   llvm::DenseMap<mlir::Value, mlir::Value> ndnzValueMapping;
   SSBufferManager ssbufferManager;
@@ -147,6 +148,7 @@ private:
                                                 mlir::Location loc);
   mlir::Operation *findMainLoopforTransfer(mlir::Operation *endOp,
                                            mlir::Operation *startOp);
+  bool isDependencyInSelectedMainLoop(const DependencyInfo &dep);
   mlir::Operation *createC2CSharedL1Buffer(mlir::OpBuilder &builder,
                                            mlir::Location loc,
                                            llvm::ArrayRef<int64_t> shape,

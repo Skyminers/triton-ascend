@@ -46,6 +46,47 @@ void MarkMainLoopPass::runOnOperation() {
   int mainLoopIdCounter = 0;
   SmallVector<Operation *> mainLoops;
 
+  // An explicit frontend hint takes precedence over the Fixpipe/Copy based
+  // heuristic below. This lets users select an outer loop even when a nested
+  // loop also contains a candidate operation.
+  module.walk([&](scf::ForOp forOp) {
+    auto hint = forOp->getAttrOfType<StringAttr>(CVPipeline::kLoopCompileHint);
+    if (hint && hint.getValue() == CVPipeline::kMainLoopHint)
+      mainLoops.push_back(forOp);
+  });
+
+  if (!mainLoops.empty()) {
+    // A frontend selection is authoritative. Remove stale/previous main-loop
+    // tags so downstream passes have no alternative main-loop candidate.
+    module.walk([&](Operation *op) {
+      if (CVPipeline::isMainLoopOp(op))
+        op->removeAttr(CVPipeline::kMainLoop);
+    });
+    for (Operation *loopOp : mainLoops) {
+      loopOp->removeAttr(CVPipeline::kLoopCompileHint);
+      loopOp->setAttr(
+          CVPipeline::kMainLoop,
+          Builder(module.getContext()).getI32IntegerAttr(mainLoopIdCounter++));
+    }
+    LOG_DEBUG("selected " << mainLoops.size()
+                          << " explicitly hinted main loop(s)\n");
+    return;
+  }
+
+  // The early invocation exists only to make an explicit frontend selection
+  // visible to every SplitDataflow stage. Preserve a selection made there
+  // when the normal (late) invocation runs.
+  if (explicitOnly)
+    return;
+
+  bool hasSelectedMainLoop = false;
+  module.walk([&](Operation *op) {
+    if (CVPipeline::isMainLoopOp(op))
+      hasSelectedMainLoop = true;
+  });
+  if (hasSelectedMainLoop)
+    return;
+
   // Find all candidate main loops (ForOp + WhileOp)
   auto isL1Fixpipe = [](Operation *op) -> bool {
     auto fixpipeOp = dyn_cast<hivm::FixpipeOp>(op);
@@ -112,8 +153,9 @@ void MarkMainLoopPass::runOnOperation() {
 // Create the pass
 namespace mlir {
 namespace triton {
-std::unique_ptr<OperationPass<ModuleOp>> createMarkMainLoopPass() {
-  return std::make_unique<MarkMainLoopPass>();
+std::unique_ptr<OperationPass<ModuleOp>>
+createMarkMainLoopPass(bool explicitOnly) {
+  return std::make_unique<MarkMainLoopPass>(explicitOnly);
 }
 } // namespace triton
 } // namespace mlir

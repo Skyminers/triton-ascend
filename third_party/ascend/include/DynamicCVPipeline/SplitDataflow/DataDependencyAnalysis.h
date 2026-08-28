@@ -59,8 +59,8 @@ struct DependencyInfo {
   bool isAllTranspoesd = false;
 
   // Optional Items for memDependencies
-  mlir::Operation *predOp;
-  mlir::Operation *nextOp;
+  mlir::Operation *predOp = nullptr;
+  mlir::Operation *nextOp = nullptr;
   // Optional Items for iterarg yield dependency
   mlir::Operation *consumerYieldOp = nullptr;
 };
@@ -183,6 +183,7 @@ private:
                              llvm::StringRef newCoreType);
   void deduplicateDependencies(llvm::SmallVector<DependencyInfo> &dependencies);
   mlir::ModuleOp module;
+  bool restrictToMainLoop = false;
 };
 
 std::unique_ptr<OperationPass<ModuleOp>> createDataDependencyAnalysisPass();

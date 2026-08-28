@@ -51,6 +51,11 @@ void SplitDataflowPass::runOnOperation() {
   OpPassManager pm(module.getOperationName());
   LDBG("Enter pass.");
 
+  // Step 0: Resolve an explicit frontend main-loop hint before any dataflow
+  // analysis or transfer placement. If there is no hint, this is a no-op and
+  // the legacy heuristic still runs after transfer insertion below.
+  pm.addPass(createMarkMainLoopPass(/*explicitOnly=*/true));
+
   // Step 1: Add block_id for control flow operations
   pm.addPass(createAddBlockIdForControlOpsPass());
 
@@ -60,7 +65,8 @@ void SplitDataflowPass::runOnOperation() {
   // Step 3: Run InterCoreTransferAndSync
   pm.addPass(createInterCoreTransferAndSyncPass());
 
-  // Step 4: Mark the main computation loop
+  // Step 4: Preserve the explicit selection, or use the legacy heuristic for
+  // kernels without a frontend hint.
   pm.addPass(createMarkMainLoopPass());
 
   // Step 5: Run SeparateCVScope

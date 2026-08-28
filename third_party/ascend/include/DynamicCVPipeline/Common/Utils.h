@@ -46,6 +46,8 @@ inline constexpr llvm::StringLiteral kCubeFirst = "ssbuffer.cube_first";
 inline constexpr llvm::StringLiteral kVectorFirst = "ssbuffer.vector_first";
 inline constexpr llvm::StringLiteral kAddFromMatmul =
     "ssbuffer.add_from_matmul";
+inline constexpr llvm::StringLiteral kLoopCompileHint = "tt.compile_hint";
+inline constexpr llvm::StringLiteral kMainLoopHint = "main_loop";
 inline constexpr llvm::StringLiteral kMainLoop = "ssbuffer.main_loop";
 inline constexpr llvm::StringLiteral kTcoreType = "hivm.tcore_type";
 inline constexpr llvm::StringLiteral kIf = "ssbuffer.if";
@@ -165,6 +167,23 @@ public:
 // True when `op` is a main_loop loop op (forOp / whileOp carrying the tag).
 inline bool isMainLoopOp(Operation *op) {
   return op && isa<scf::ForOp, scf::WhileOp>(op) && op->hasAttr(kMainLoop);
+}
+
+// Return the explicitly/heuristically selected main loop containing `op`.
+// The operation itself is considered so this also works when `op` is the
+// selected scf.for/scf.while.
+inline Operation *getEnclosingMainLoop(Operation *op) {
+  for (Operation *current = op; current; current = current->getParentOp()) {
+    if (isMainLoopOp(current))
+      return current;
+  }
+  return nullptr;
+}
+
+// True when both operations are contained by the same selected main loop.
+inline bool areInSameMainLoop(Operation *lhs, Operation *rhs) {
+  Operation *lhsMainLoop = getEnclosingMainLoop(lhs);
+  return lhsMainLoop && lhsMainLoop == getEnclosingMainLoop(rhs);
 }
 
 CoreType getCoreTypeOfSimpleOpOrCf(Operation *op);
