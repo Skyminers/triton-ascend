@@ -25,6 +25,7 @@
 
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "llvm/ADT/SmallVector.h"
 #include <optional>
@@ -44,6 +45,10 @@ struct CubePageLoader {
 // direct GM-to-L1 DMA before it can be assigned to CUBE.
 std::optional<SmallVector<CubePageLoader>>
 getCubePageLoaders(tensor::InsertSliceOp root);
+
+// The loop form: one private page per iteration, covering the complete
+// aggregate in order, with a single matmul consumer (possibly via transpose).
+std::optional<CubePageLoader> getCubePageLoaderLoop(scf::ForOp loop);
 
 } // namespace mlir::CVPipeline
 

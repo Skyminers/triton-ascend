@@ -1209,11 +1209,14 @@ int OpClassifierPass::penetrateCubeIntoForLoops() {
   // Use a combined walk to collect both ForOps and WhileOps
   llvm::SmallVector<Operation *> loaderLoops;
   getOperation().walk([&](scf::ForOp forOp) {
-    if (isCubeLoaderForOp(forOp))
+    auto page = CVPipeline::getCubePageLoaderLoop(forOp);
+    if ((page && !isExtractedLoadStoreRelated(page->tensor)) ||
+        (CVPipeline::isCubeBlockMergeEnabled() && isCubeLoaderForOp(forOp)))
       loaderLoops.push_back(forOp);
   });
   getOperation().walk([&](scf::WhileOp whileOp) {
-    if (isCubeLoaderForWhileOp(whileOp))
+    if (CVPipeline::isCubeBlockMergeEnabled() &&
+        isCubeLoaderForWhileOp(whileOp))
       loaderLoops.push_back(whileOp);
   });
 
@@ -1914,8 +1917,7 @@ void OpClassifierPass::runOnOperation() {
   }
 
   // Step 4: Penetrate CUBE coloring into pure loader for-loops.
-  if (CVPipeline::isCubeBlockMergeEnabled() &&
-      penetrateCubeIntoForLoops() != 0) {
+  if (penetrateCubeIntoForLoops() != 0) {
     CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
     return;
   }
