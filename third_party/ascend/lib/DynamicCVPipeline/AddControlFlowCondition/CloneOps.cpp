@@ -134,7 +134,7 @@ cloneOpsForBlock(int curId, SmallVector<Operation *> &curOps,
   OpBuilder builder(curOps.front());
 
   for (Operation *op : toClone) {
-    // The consumer reads the producer's shared L1 buffer. Replaying these
+    // The consumer reads the producer's shared buffer. Replaying these
     // writes would also replay its page metadata loads in every consumer.
     if (op->hasAttr(CVPipeline::kSharedPageWrite)) {
       assert(op->getNumResults() == 0 &&

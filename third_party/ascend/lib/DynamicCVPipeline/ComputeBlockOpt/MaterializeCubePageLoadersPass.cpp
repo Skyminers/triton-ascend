@@ -20,6 +20,7 @@
  * THE SOFTWARE.
  */
 
+#include "DynamicCVPipeline/Common/SSBufferManager.h"
 #include "DynamicCVPipeline/Common/Utils.h"
 #include "DynamicCVPipeline/ComputeBlockOpt/CubePageLoaders.h"
 #include "DynamicCVPipeline/ComputeBlockOpt/Passes.h"
@@ -546,8 +547,8 @@ bool canSharePreparation(ArrayRef<CVPipeline::CubePageLoader> first,
                                 rightReads) ||
         leftReads.empty() || leftReads != rightReads)
       return false;
-    // Sharing also moves the payload read. The common descriptor alone does
-    // not prove that V was not modified between its old and new positions.
+    // Conservatively require an unchanged payload while pairing the chains.
+    // Shared metadata alone does not establish alias independence.
     if (!left.copy->isBeforeInBlock(right.copy))
       return false;
     for (Operation *between = left.copy; between != right.copy;
@@ -673,64 +674,141 @@ MaterializedPages materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
   return result;
 }
 
-// Move a validated page's address/guard operations next to its sibling load.
-// Existing definitions before the insertion point stay in place.
-void movePagePreparation(Operation *op, Operation *&after, Attribute producerId,
-                         Attribute consumerId) {
-  Block *body = after->getBlock();
-  op->walk([&](Operation *nested) {
-    for (Value operand : nested->getOperands()) {
-      Operation *def = operand.getDefiningOp();
-      if (!def || def == op || op->isProperAncestor(def) ||
-          def->getBlock() != body)
-        continue;
-      if (def->getAttr(CVPipeline::kBlockId) == consumerId)
-        movePagePreparation(def, after, producerId, consumerId);
-    }
-  });
-  if (op->getAttr(CVPipeline::kBlockId) == consumerId) {
-    op->walk([&](Operation *nested) {
-      nested->setAttr(CVPipeline::kBlockId, producerId);
-    });
-    if (after->isBeforeInBlock(op)) {
-      op->moveAfter(after);
-      after = op;
-    }
-  }
-}
-
-void sharePagePreparation(MaterializedPages &first, MaterializedPages &second,
-                          int groupId) {
-  Operation *loop = first.buffer->getBlock()->getParentOp();
+// Share only raw metadata. Moving all V payload loads into QK couples their
+// buffer lifetimes and prevents QK from running ahead of PV. A small SSBuffer
+// ring preserves one GM metadata read per page while each matmul owns its L1
+// buffer and DMA schedule. Occupancy prevents a slot from being overwritten
+// until the consumer finishes; each block indexes its own logical iteration.
+bool sharePageMetadata(MaterializedPages &first, MaterializedPages &second,
+                       int groupId) {
+  constexpr int64_t slots = 2;
+  auto loop = cast<scf::ForOp>(first.buffer->getBlock()->getParentOp());
   auto producerId = first.fill->getAttr(CVPipeline::kBlockId);
   auto consumerId = second.fill->getAttr(CVPipeline::kBlockId);
+  SmallVector<memref::LoadOp> metadata;
+  llvm::SmallPtrSet<Operation *, 32> oldPreparation;
+  for (auto load : second.loads) {
+    llvm::SetVector<Operation *> ops;
+    llvm::DenseSet<Operation *> reads;
+    if (!collectPagePreparation(load.getSrc(), loop.getBody(), ops, reads) ||
+        reads.size() != 1)
+      return false;
+    auto scalar = cast<memref::LoadOp>(*reads.begin());
+    if (!scalar.getType().isInteger(32) || scalar->getBlock() != loop.getBody())
+      return false;
+    metadata.push_back(scalar);
+    for (Operation *op : ops)
+      if (op->getAttr(CVPipeline::kBlockId) == consumerId)
+        oldPreparation.insert(op);
+  }
   OpBuilder builder(loop);
   if (!loop->hasAttr(CVPipeline::kBlockId))
     loop->setAttr(CVPipeline::kBlockId,
                   builder.getI32IntegerAttr(CVPipeline::getAvailableBlockId(
                       loop->getParentOfType<ModuleOp>())));
-  // One shared V aggregate, protected by the existing C2C producer/consumer
-  // counters. The producer cannot start another iteration until PV consumes V.
-  second.buffer->moveBefore(loop);
-  second.buffer->setAttr(CVPipeline::kBlockId,
-                         loop->getAttr(CVPipeline::kBlockId));
-  second.zero->moveBefore(first.loads.front());
-  second.fill->moveBefore(first.loads.front());
-  second.zero->setAttr(CVPipeline::kBlockId, producerId);
-  second.fill->setAttr(CVPipeline::kBlockId, producerId);
-  second.fill->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
-  // One producer marker denotes one buffer, not one marker per page DMA.
-  second.fill->setAttr(
-      CVPipeline::kIntraDeps,
-      builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreProducerId}));
-  second.reader->setAttr(
-      CVPipeline::kIntraDeps,
-      builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreConsumerId}));
-  for (auto [left, right] : llvm::zip(first.loads, second.loads)) {
-    Operation *after = left;
-    movePagePreparation(right, after, producerId, consumerId);
-    right->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
+  auto tag = [&](Operation *op, Attribute id) {
+    op->setAttr(CVPipeline::kBlockId, id);
+    op->setAttr(CVPipeline::kCoreType, builder.getStringAttr("CUBE"));
+  };
+  auto module = loop->getParentOfType<ModuleOp>();
+  auto base = triton::SSBufferManager::reserveBytes(
+      module, slots * metadata.size() * sizeof(int32_t));
+  if (!base)
+    return false;
+  auto addr = builder.create<arith::ConstantIntOp>(loop.getLoc(), *base, 64);
+  tag(addr, loop->getAttr(CVPipeline::kBlockId));
+  auto cache = builder.create<hivm::PointerCastOp>(
+      loop.getLoc(),
+      MemRefType::get(
+          {slots, static_cast<int64_t>(metadata.size())}, builder.getI32Type(),
+          nullptr,
+          builder.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::SSBUF)),
+      addr.getResult());
+  tag(cache, loop->getAttr(CVPipeline::kBlockId));
+  auto slot = [&](Operation *before, Attribute id) {
+    builder.setInsertionPoint(before);
+    auto loc = before->getLoc();
+    auto relative = builder.create<arith::SubIOp>(loc, loop.getInductionVar(),
+                                                  loop.getLowerBound());
+    tag(relative, id);
+    // The trip distance is nonnegative and scf.for has a positive step.
+    // Unsigned arithmetic also lets power-of-two slots lower to a bit mask.
+    auto iteration =
+        builder.create<arith::DivUIOp>(loc, relative, loop.getStep());
+    tag(iteration, id);
+    auto capacity = builder.create<arith::ConstantOp>(
+        loc, builder.getIntegerAttr(iteration.getType(), slots));
+    tag(capacity, id);
+    auto rem = builder.create<arith::RemUIOp>(loc, iteration, capacity);
+    tag(rem, id);
+    auto index = builder.createOrFold<arith::IndexCastOp>(
+        loc, builder.getIndexType(), rem);
+    if (auto *op = index.getDefiningOp())
+      tag(op, id);
+    return index;
+  };
+  Value producerSlot = slot(first.loads.front(), producerId);
+  Value consumerSlot = slot(second.loads.front(), consumerId);
+  for (unsigned i = 0; i < metadata.size(); ++i) {
+    auto raw = metadata[i];
+    builder.setInsertionPointAfter(first.loads[i]);
+    auto page = builder.create<arith::ConstantIndexOp>(raw.getLoc(), i);
+    tag(page, producerId);
+    auto store = builder.create<memref::StoreOp>(
+        raw.getLoc(), raw, cache, ValueRange{producerSlot, page});
+    tag(store, producerId);
+    store->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
+    if (i == 0) {
+      store->setAttr(CVPipeline::kSharedPageSlots,
+                     builder.getI32IntegerAttr(slots));
+      store->setAttr(
+          CVPipeline::kIntraDeps,
+          builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreProducerId}));
+    }
+    builder.setInsertionPoint(second.loads[i]);
+    auto read = builder.create<memref::LoadOp>(raw.getLoc(), cache,
+                                               ValueRange{consumerSlot, page});
+    tag(read, consumerId);
+    if (i == 0)
+      read->setAttr(
+          CVPipeline::kIntraDeps,
+          builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreConsumerId}));
+    auto mark =
+        builder.create<annotation::MarkOp>(raw.getLoc(), read.getResult());
+    tag(mark, consumerId);
+    mark->setAttr(triton::kMemrefExtVolatile, builder.getUnitAttr());
+    // Rebuild the consumer view from its cached raw value. Retain all masks,
+    // selects, and row-count clamping rather than caching a partially decoded
+    // address that could lose the masked-off page semantics.
+    IRMapping mapping;
+    mapping.map(raw.getResult(), read.getResult());
+    std::function<Value(Value)> clone = [&](Value value) -> Value {
+      if (mapping.contains(value))
+        return mapping.lookup(value);
+      Operation *op = value.getDefiningOp();
+      if (!op || op->getBlock() != loop.getBody())
+        return value;
+      op->walk([&](Operation *nested) {
+        for (Value operand : nested->getOperands()) {
+          Operation *def = operand.getDefiningOp();
+          if (def && (def == op || op->isProperAncestor(def)))
+            continue;
+          mapping.map(operand, clone(operand));
+        }
+      });
+      auto *copied = builder.clone(*op, mapping);
+      copied->walk([&](Operation *nested) { tag(nested, consumerId); });
+      return mapping.lookup(value);
+    };
+    second.loads[i].getSrcMutable().assign(clone(second.loads[i].getSrc()));
   }
+  // Dead original views would keep the GM metadata chain live when CloneOps
+  // makes each compute block independent. Remove only replaced preparation.
+  for (Operation &op :
+       llvm::make_early_inc_range(llvm::reverse(*loop.getBody())))
+    if (oldPreparation.contains(&op) && isOpTriviallyDead(&op))
+      op.erase();
+  return true;
 }
 
 class MaterializeCubePageLoadersPass
@@ -739,9 +817,10 @@ class MaterializeCubePageLoadersPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(MaterializeCubePageLoadersPass)
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<hivm::HIVMDialect, arith::ArithDialect,
-                    memref::MemRefDialect, bufferization::BufferizationDialect,
-                    linalg::LinalgDialect, scf::SCFDialect>();
+    registry.insert<annotation::AnnotationDialect, hivm::HIVMDialect,
+                    arith::ArithDialect, memref::MemRefDialect,
+                    bufferization::BufferizationDialect, linalg::LinalgDialect,
+                    scf::SCFDialect>();
   }
   StringRef getArgument() const override {
     return "materialize-cube-page-loaders";
@@ -799,9 +878,32 @@ public:
     SmallVector<MaterializedPages> materialized;
     for (const auto &pages : chains)
       materialized.push_back(materializePages(pages));
-    for (auto [first, second] : shared)
-      sharePagePreparation(materialized[first], materialized[second],
-                           groupId++);
+    SmallVector<hivm::ND2NZOp> loads;
+    for (auto [first, second] : shared) {
+      if (!sharePageMetadata(materialized[first], materialized[second],
+                             groupId))
+        continue;
+      ++groupId;
+      llvm::append_range(loads, materialized[first].loads);
+      llvm::append_range(loads, materialized[second].loads);
+    }
+    // Empty and masked-off pages are already zero-filled. Avoid submitting a
+    // zero-row DMA; the metadata read and ring write still occur for every
+    // page.
+    for (auto load : loads) {
+      OpBuilder builder(load);
+      auto zero = builder.create<arith::ConstantIndexOp>(load.getLoc(), 0);
+      auto rows = builder.createOrFold<memref::DimOp>(
+          load.getLoc(), load.getSrc(), zero.getResult());
+      auto active = builder.create<arith::CmpIOp>(
+          load.getLoc(), arith::CmpIPredicate::ugt, rows, zero);
+      for (Value value : {rows, Value(zero), Value(active)})
+        if (auto *op = value.getDefiningOp())
+          copyBlockAssignment(load, op);
+      auto guarded = builder.create<scf::IfOp>(load.getLoc(), active, false);
+      copyBlockAssignment(load, guarded);
+      load->moveBefore(guarded.thenYield());
+    }
   }
 };
 

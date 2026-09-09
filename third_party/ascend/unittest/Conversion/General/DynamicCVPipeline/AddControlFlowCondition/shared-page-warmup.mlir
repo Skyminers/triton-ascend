@@ -1,6 +1,19 @@
 // RUN: triton-opt --add-control-flow-condition --verify-each %s | FileCheck %s --check-prefix=SHARED --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 // RUN: sed 's/ssbuffer.shared_page_write, //g' %s | triton-opt --add-control-flow-condition --verify-each | FileCheck %s --check-prefix=ORDINARY --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 
+// RUN: sed 's/ssbuffer.shared_page_write, /ssbuffer.shared_page_slots = 2 : i32, ssbuffer.shared_page_write, /g' %s | triton-opt --add-control-flow-condition --verify-each | FileCheck %s --check-prefix=RING --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
+
+// RUN: sed 's/module attributes {/module attributes {ssbuffer.reserved_bytes = 1024 : i64,/' %s | triton-opt --add-control-flow-condition --verify-each | FileCheck %s --check-prefix=NO-SPACE --implicit-check-not=hivm.hir.pointer_cast
+// NO-SPACE: triton_ascend.dynamic_cv_pipeline.rc
+// NO-SPACE: func.func @shared_page_warmup
+
+// RING-LABEL: func.func @shared_page_warmup
+// RING: arith.cmpi ne,
+// RING: ssbuffer.if = 1 : i32
+// RING: arith.cmpi sge,
+// RING: arith.cmpi sge,
+// RING: ssbuffer.if = 3 : i32
+
 // QK -> VECTOR -> PV has two cross-core slots and three ordinary intra-core
 // slots, which normally delays PV until two QK iterations have completed.
 // The additional single shared V slot must instead allow PV to consume the

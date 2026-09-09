@@ -1,56 +1,95 @@
 // RUN: triton-opt --split-input-file --materialize-cube-page-loaders --reorder-ops-by-block-id --verify-each %s | FileCheck %s --check-prefix=MATERIAL
-// RUN: triton-opt --split-input-file --materialize-cube-page-loaders --reorder-ops-by-block-id --clone-ops --verify-each %s | FileCheck %s --check-prefix=CLONE
+// RUN: triton-opt --split-input-file --materialize-cube-page-loaders --reorder-ops-by-block-id --clone-ops --verify-each %s | FileCheck %s --check-prefix=CLONE --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 // RUN: triton-opt --materialize-cube-page-loaders --reorder-ops-by-block-id --add-control-flow-condition --verify-each %s | FileCheck %s --check-prefix=CONDITION --implicit-check-not=triton_ascend.dynamic_cv_pipeline.rc
 
 // RUN: sed 's@// CLOBBER_V@memref.store %%zero, %%v[%%c0] {ssbuffer.block_id = 3 : i32, ssbuffer.core_type = "CUBE"} : memref<?xf16>@' %s | triton-opt --materialize-cube-page-loaders --verify-each | FileCheck %s --check-prefix=UNSHARED
 
 // RUN: sed '/%%meta0 = memref.load/s/{ssbuffer.block_id/{volatile, ssbuffer.block_id/' %s | triton-opt --materialize-cube-page-loaders --verify-each | FileCheck %s --check-prefix=UNSHARED
 
+// A nested read cannot be stored outside its branch.
+// RUN: sed '/%%meta0 = memref.load/s/\(%%meta0 = \)\(memref.load.*\)/\1scf.if %%enabled -> (i32) { %%nested = \2 scf.yield %%nested : i32 } else { scf.yield %%shift : i32 } {ssbuffer.block_id = 1 : i32, ssbuffer.core_type = "CUBE"}/' %s | triton-opt --materialize-cube-page-loaders --verify-each | FileCheck %s --check-prefix=UNSHARED
+
+// RUN: sed '1i module attributes {ssbuffer.reserved_bytes = 1024 : i64} {' %s | sed '$a }' | triton-opt --materialize-cube-page-loaders --verify-each | FileCheck %s --check-prefix=UNSHARED
+
 // UNSHARED-LABEL: func.func @shared_pages
 // UNSHARED-NOT: ssbuffer.shared_page_write
 // UNSHARED: return
 
-// K and V use the same two page descriptors but feed separate matmuls.
-// V is prepared with K; the second matmul consumes the shared L1 aggregate.
-// One shared buffer is occupied until PV consumes it.
-// Metadata stays with its own K/V pair; no later page is prefetched.
+// RUN: sed 's/%%c0 to %%c3 step %%c1/%%c1 to %%c8 step %%c2/' %s | triton-opt --materialize-cube-page-loaders --verify-each | FileCheck %s --check-prefix=RING
+
+// Nonzero lower bounds and non-unit steps select slots by trip number.
+// RING-LABEL: func.func @shared_pages
+// RING: %[[ONE:.*]] = arith.constant 1 : index
+// RING: %[[TWO:.*]] = arith.constant 2 : index
+// RING: scf.for %[[IV:.*]] = %[[ONE]] to %{{.*}} step %[[TWO]]
+// RING: %[[REL:.*]] = arith.subi %[[IV]], %[[ONE]]
+// RING: %[[ITER:.*]] = arith.divui %[[REL]], %[[TWO]]
+// RING: arith.remui %[[ITER]]
+// RING: linalg.matmul
+// RING: %[[CREL:.*]] = arith.subi %[[IV]], %[[ONE]]
+// RING: %[[CITER:.*]] = arith.divui %[[CREL]], %[[TWO]]
+// RING: arith.remui %[[CITER]]
+// RING: linalg.matmul
+
+// Cache the raw i32 page metadata in two slots. QK can prepare the next K
+// while PV independently loads V from the metadata for its own iteration.
 // MATERIAL-LABEL: func.func @shared_pages
-// MATERIAL: %[[VBUF:.*]] = memref.alloc() {{.*}}ssbuffer.block_id = 0 : i32{{.*}}memref<1x1x16x16xf16, #hivm.address_space<cbuf>>
+// MATERIAL: %[[CACHE:.*]] = hivm.hir.pointer_cast(%{{.*}}) {{.*}}memref<2x2xi32, #hivm.address_space<ssbuf>>
 // MATERIAL: scf.for
-// MATERIAL-NOT: arith.remsi
-// MATERIAL: linalg.fill {{.*}}ssbuffer.block_id = 1 : i32{{.*}}ssbuffer.intraDeps = [0 : i32, 1 : i32]{{.*}}ssbuffer.shared_page_write{{.*}}outs(%[[VBUF]]
-// MATERIAL-COUNT-4: hivm.hir.nd2nz {{.*}}ssbuffer.block_id = 1 : i32
+// MATERIAL: arith.subi
+// MATERIAL: arith.divui
+// MATERIAL: arith.remui
+// MATERIAL: scf.if
+// MATERIAL: hivm.hir.nd2nz {{.*}}ssbuffer.block_id = 1 : i32
+// MATERIAL: memref.store %{{.*}}, %[[CACHE]]{{.*}}ssbuffer.intraDeps = [0 : i32, 1 : i32]{{.*}}ssbuffer.shared_page_slots = 2 : i32{{.*}}ssbuffer.shared_page_write
+// MATERIAL: scf.if
+// MATERIAL: hivm.hir.nd2nz {{.*}}ssbuffer.block_id = 1 : i32
+// MATERIAL: memref.store %{{.*}}, %[[CACHE]]
 // MATERIAL: linalg.matmul {{.*}}ssbuffer.block_id = 1 : i32
-// MATERIAL: memref.memory_space_cast {{.*}}ssbuffer.block_id = 3 : i32{{.*}}ssbuffer.intraDeps = [0 : i32, 0 : i32]
+// MATERIAL: arith.remui
+// MATERIAL: memref.load %[[CACHE]]{{.*}}ssbuffer.intraDeps = [0 : i32, 0 : i32]
+// MATERIAL: hivm.hir.nd2nz {{.*}}ssbuffer.block_id = 3 : i32
+// MATERIAL: memref.load %[[CACHE]]
+// MATERIAL: hivm.hir.nd2nz {{.*}}ssbuffer.block_id = 3 : i32
 // MATERIAL: linalg.matmul {{.*}}ssbuffer.block_id = 3 : i32
-// CLONE-LABEL: func.func @shared_pages
+// CLONE-LABEL: func.func @shared_pages(
+// CLONE-SAME: %[[META:[^:]+]]:
+// CLONE: %[[CACHE:.*]] = hivm.hir.pointer_cast
 // CLONE: scf.for
-// CLONE: memref.load
+// CLONE: memref.load %[[META]]
 // CLONE-NOT: memref.load
-// CLONE-COUNT-2: hivm.hir.nd2nz
-// CLONE: memref.load
+// CLONE: hivm.hir.nd2nz
+// CLONE: memref.load %[[META]]
 // CLONE-NOT: memref.load
-// CLONE-COUNT-2: hivm.hir.nd2nz
+// CLONE: hivm.hir.nd2nz
 // CLONE: linalg.matmul {{.*}}ssbuffer.block_id = 1 : i32
-// CLONE-NOT: memref.load
-// CLONE-NOT: hivm.hir.nd2nz
+// CLONE-NOT: memref.load %[[META]]
+// CLONE: memref.load %[[CACHE]]
+// CLONE: hivm.hir.nd2nz
+// CLONE-NOT: memref.load %[[META]]
+// CLONE: memref.load %[[CACHE]]
+// CLONE: hivm.hir.nd2nz
+// CLONE-NOT: memref.load %[[META]]
 // CLONE: linalg.matmul {{.*}}ssbuffer.block_id = 3 : i32
 
 // CONDITION-LABEL: func.func @shared_pages
-// CONDITION: scf.for {{.*}}iter_args({{.*}}, %[[COUNT:.*]] = %{{.*}}) -> (index, index, i32)
-// CONDITION: arith.constant 1 : i32
-// CONDITION-NEXT: %[[ZERO:.*]] = arith.constant 0 : i32
-// CONDITION: arith.cmpi eq, %[[COUNT]], %[[ZERO]] : i32
-// CONDITION: %[[PRODUCED:.*]]:2 = scf.if {{.*}} -> (i32, index)
+// CONDITION: scf.for {{.*}}iter_args(%[[PITER:[^ ]+]] = %{{.*}}, %[[CITER:[^ ]+]] = %{{.*}}, %[[COUNT:[^ ]+]] = %{{.*}}) -> (index, index, i32)
+// CONDITION: %[[CAPACITY:.*]] = arith.constant 2 : i32
+// CONDITION: arith.cmpi ne, %[[COUNT]], %[[CAPACITY]] : i32
+// CONDITION: %[[PRODUCED:.*]]:2 = scf.if
+// CONDITION: arith.subi %[[PITER]],
+// CONDITION: arith.remui
 // CONDITION: linalg.matmul {{.*}}ssbuffer.block_id = 1 : i32
 // CONDITION: arith.addi %[[COUNT]], %{{.*}} : i32
 // CONDITION: ssbuffer.if = 1 : i32
-// CONDITION: arith.cmpi sgt, %[[PRODUCED]]#0, %{{.*}} : i32
+// CONDITION: arith.cmpi sgt, %[[PRODUCED]]#{{[01]}}, %{{.*}} : i32
+// CONDITION: arith.subi %[[CITER]],
+// CONDITION: arith.remui
 // CONDITION: linalg.matmul {{.*}}ssbuffer.block_id = 3 : i32
-// CONDITION: arith.subi %[[PRODUCED]]#0, %{{.*}} : i32
+// CONDITION: arith.subi %[[PRODUCED]]#{{[01]}}, %{{.*}} : i32
 // CONDITION: ssbuffer.if = 3 : i32
 
-func.func @shared_pages(%metadata: memref<?xi32>, %k: memref<?xf16>, %v: memref<?xf16>, %q: tensor<16x16xf16>, %p: tensor<16x16xf16>) {
+func.func @shared_pages(%metadata: memref<?xi32>, %k: memref<?xf16>, %v: memref<?xf16>, %q: tensor<16x16xf16>, %p: tensor<16x16xf16>, %enabled: i1) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index
   %c2 = arith.constant 2 : index

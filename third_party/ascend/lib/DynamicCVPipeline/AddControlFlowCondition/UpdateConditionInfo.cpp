@@ -910,15 +910,21 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
   }
   for (auto &group : outputGroups) {
     int size = group.outputs.size();
-    // A shared page buffer has one slot: only an empty buffer may be filled.
+    // Shared page writes represent a ring rather than one buffer per producer.
     // Use an availability test, so downstream completion discovery does not
-    // confuse this non-monotonic occupancy with the loop progress counter.
+    // confuse its non-monotonic occupancy with the loop progress counter.
     bool sharedPage = size == 1 && group.outputs.front()->hasAttr(
                                        CVPipeline::kSharedPageWrite);
-    auto predicate =
-        sharedPage ? arith::CmpIPredicate::eq : arith::CmpIPredicate::slt;
+    if (sharedPage) {
+      if (auto slots = group.outputs.front()->getAttrOfType<IntegerAttr>(
+              CVPipeline::kSharedPageSlots))
+        size = slots.getInt();
+    }
+    auto predicate = sharedPage ? (size == 1 ? arith::CmpIPredicate::eq
+                                             : arith::CmpIPredicate::ne)
+                                : arith::CmpIPredicate::slt;
     Value limitVal = builder.create<arith::ConstantIntOp>(
-        loc, sharedPage ? 0 : size, CONST_INT_TYPE);
+        loc, sharedPage && size == 1 ? 0 : size, CONST_INT_TYPE);
     for (Value var : group.inputVars) {
       Value varToUse = var;
       auto latestIt = controlVarToLatestValue.find(var);
@@ -1161,9 +1167,8 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
 
   // Get the start node
   scf::IfOp sourceIfOp = info->flowOptIfOpPairs[currentIfOp];
-  // Shared V has one slot. Waiting for multiple QK iterations before PV
-  // would deadlock: QK cannot reuse that slot until PV consumes it. The
-  // existing cross-core and intra-core conditions already ensure readiness.
+  // Do not warm up more QK iterations than a shared page ring can hold: QK
+  // cannot reuse an occupied slot until PV consumes it.
   auto depsIt = info->intraCoreDependentMap.find(loopOp);
   if (depsIt != info->intraCoreDependentMap.end()) {
     for (auto &entry : depsIt->second) {
@@ -1172,8 +1177,15 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
       Operation *producer = entry.second.front();
       if (producer->hasAttr(CVPipeline::kSharedPageWrite) &&
           sourceIfOp->isAncestor(producer)) {
-        flowOptCond = nullptr;
-        return UPDATE_CONDITION_INFO_SUCCESS;
+        int slots = 1;
+        if (auto attr = producer->getAttrOfType<IntegerAttr>(
+                CVPipeline::kSharedPageSlots))
+          slots = attr.getInt();
+        if (slots < std::min(info->intraCoreBufferCount - 1,
+                             info->crossCoreBufferCount)) {
+          flowOptCond = nullptr;
+          return UPDATE_CONDITION_INFO_SUCCESS;
+        }
       }
     }
   }
@@ -1942,6 +1954,17 @@ void UpdateConditionInfoPass::runOnOperation() {
   }
 
   LDBG("Enter UpdateConditionInfo pass." << "\n");
+  int64_t reserved = 0;
+  if (auto attr = module->getAttrOfType<IntegerAttr>(
+          SSBufferManager::RESERVED_BYTES_ATTR))
+    reserved = attr.getInt();
+  if (reserved < 0 || reserved > SSBufferManager::PIPELINE_BANK_BYTES ||
+      info->crossCoreDependentMap.size() * VALUE_SSBUF_OFFSET >
+          SSBufferManager::PIPELINE_BANK_BYTES - reserved) {
+    CVPipeline::setFallbackAttr(module, CVPipeline::ERRCODE_FAILED);
+    return;
+  }
+
   // Step1:Init the ssbufferPtrs
   SmallVector<SmallVector<Value>> ssbufferPtrs = allocSSBuffer(module);
 
