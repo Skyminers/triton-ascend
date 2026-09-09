@@ -27,14 +27,19 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/HIVM/Utils/Utils.h"
 #include "bishengir/Dialect/Utils/Util.h"
+#include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Interfaces/ViewLikeInterface.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <algorithm>
 
 using namespace mlir;
@@ -199,6 +204,253 @@ CVPipeline::getCubePageLoaders(tensor::InsertSliceOp root) {
 
 namespace {
 
+bool mayModifyOrFree(Operation *op, Value buffer, AliasAnalysis &aliases) {
+  auto effects = getEffectsRecursively(op);
+  if (!effects)
+    return true;
+  for (const auto &effect : *effects) {
+    if (!isa<MemoryEffects::Write, MemoryEffects::Free>(effect.getEffect()))
+      continue;
+    if (!effect.getValue() || !aliases.alias(effect.getValue(), buffer).isNo())
+      return true;
+  }
+  return false;
+}
+
+bool sameScalar(Value lhs, Value rhs, AliasAnalysis &aliases,
+                unsigned depth = 0) {
+  if (lhs == rhs)
+    return true;
+  Attribute lhsAttr, rhsAttr;
+  if (matchPattern(lhs, m_Constant(&lhsAttr)) &&
+      matchPattern(rhs, m_Constant(&rhsAttr)))
+    return lhsAttr == rhsAttr;
+  Operation *a = lhs.getDefiningOp(), *b = rhs.getDefiningOp();
+  if (depth == 12 || !a || !b || a->getName() != b->getName() ||
+      lhs.getType() != rhs.getType() || a->getNumResults() != 1 ||
+      b->getNumResults() != 1 || a->getNumRegions() || b->getNumRegions() ||
+      a->getNumOperands() != b->getNumOperands() ||
+      a->getPropertiesAsAttribute() != b->getPropertiesAsAttribute())
+    return false;
+  NamedAttrList aAttrs(a->getAttrs()), bAttrs(b->getAttrs());
+  for (StringRef name : {CVPipeline::kBlockId, CVPipeline::kCoreType}) {
+    aAttrs.erase(name);
+    bAttrs.erase(name);
+  }
+  if (aAttrs != bAttrs)
+    return false;
+  if (auto load = dyn_cast<memref::LoadOp>(a)) {
+    // Compute-block planning clones counts and their address arithmetic.
+    // Equal addresses are insufficient if memory changed between the reads.
+    if (a->getBlock() != b->getBlock() || a->hasAttr("volatile") ||
+        llvm::any_of(a->getUsers(), [](Operation *user) {
+          return isa<annotation::MarkOp>(user);
+        }) ||
+        llvm::any_of(b->getUsers(), [](Operation *user) {
+          return isa<annotation::MarkOp>(user);
+        }))
+      return false;
+    Operation *first = a->isBeforeInBlock(b) ? a : b;
+    Operation *last = first == a ? b : a;
+    for (Operation *op = first->getNextNode(); op != last;
+         op = op->getNextNode())
+      if (mayModifyOrFree(op, load.getMemRef(), aliases))
+        return false;
+  } else if (!isMemoryEffectFree(a) || !isSpeculatable(a) ||
+             !isMemoryEffectFree(b) || !isSpeculatable(b)) {
+    return false;
+  }
+  for (auto [aOperand, bOperand] :
+       llvm::zip(a->getOperands(), b->getOperands()))
+    if (!sameScalar(aOperand, bOperand, aliases, depth + 1))
+      return false;
+  return true;
+}
+
+// An executing signed scf.for iteration satisfies iv < upper, including
+// every operand of a signed minimum used as the upper bound.
+bool upperImpliesLessThan(Value upper, Value bound, AliasAnalysis &aliases) {
+  if (sameScalar(upper, bound, aliases))
+    return true;
+  auto min = upper.getDefiningOp<arith::MinSIOp>();
+  return min && (upperImpliesLessThan(min.getLhs(), bound, aliases) ||
+                 upperImpliesLessThan(min.getRhs(), bound, aliases));
+}
+
+bool isTrueInLoop(Value condition, scf::ForOp loop, AliasAnalysis &aliases) {
+  if (matchPattern(condition, m_One()))
+    return true;
+  if (auto andOp = condition.getDefiningOp<arith::AndIOp>())
+    return isTrueInLoop(andOp.getLhs(), loop, aliases) &&
+           isTrueInLoop(andOp.getRhs(), loop, aliases);
+  auto cmp = condition.getDefiningOp<arith::CmpIOp>();
+  return cmp && cmp.getPredicate() == arith::CmpIPredicate::slt &&
+         cmp.getLhs() == loop.getInductionVar() &&
+         upperImpliesLessThan(loop.getUpperBound(), cmp.getRhs(), aliases);
+}
+
+struct MaskedMetadataLoad {
+  scf::IfOp ifOp;
+  memref::LoadOp load;
+  memref::ReinterpretCastOp view;
+  Value other;
+};
+
+std::optional<MaskedMetadataLoad> getMaskedMetadataLoad(scf::IfOp ifOp) {
+  if (ifOp.getNumResults() != 1 || !ifOp.getResult(0).getType().isInteger(32) ||
+      ifOp.getElseRegion().empty())
+    return std::nullopt;
+  auto &thenBlock = ifOp.getThenRegion().front();
+  auto &elseBlock = ifOp.getElseRegion().front();
+  if (!llvm::hasSingleElement(elseBlock))
+    return std::nullopt;
+  auto load = cast<scf::YieldOp>(thenBlock.getTerminator())
+                  .getOperand(0)
+                  .getDefiningOp<memref::LoadOp>();
+  if (!load || load->getBlock() != &thenBlock || !load->hasOneUse() ||
+      load->hasAttr("volatile") || load.getIndices().size() != 1 ||
+      !matchPattern(load.getIndices()[0], m_Zero()))
+    return std::nullopt;
+  auto view = load.getMemRef().getDefiningOp<memref::ReinterpretCastOp>();
+  if (!view || view->getBlock() != &thenBlock || !view->hasOneUse() ||
+      !isGMSource(view.getSource()) ||
+      view.getSource().getParentBlock() == &thenBlock ||
+      view.getType().getShape() != ArrayRef<int64_t>{1} ||
+      view.getStaticSizes() != ArrayRef<int64_t>{1} ||
+      view.getStaticStrides() != ArrayRef<int64_t>{1})
+    return std::nullopt;
+  for (Operation &op : thenBlock.without_terminator()) {
+    if (&op == load || &op == view)
+      continue;
+    // Hoist only address arithmetic. In particular, do not speculate another
+    // memory access, a division that may trap, or a volatile annotation.
+    if (op.getName().getDialectNamespace() != "arith" ||
+        !isMemoryEffectFree(&op) || !isSpeculatable(&op))
+      return std::nullopt;
+  }
+  return MaskedMetadataLoad{
+      ifOp, load, view,
+      cast<scf::YieldOp>(elseBlock.getTerminator()).getOperand(0)};
+}
+
+void copyBlockAssignment(Operation *from, Operation *to) {
+  for (StringRef name : {CVPipeline::kBlockId, CVPipeline::kCoreType})
+    if (Attribute attr = from->getAttr(name))
+      to->setAttr(name, attr);
+}
+
+// A known active metadata read supplies a valid address for masked-off reads
+// later in the same iteration. Select the address *before* loading, then select
+// `other` afterwards. This preserves tail pages without a branch per page.
+void simplifyMetadataMasks(
+    ArrayRef<SmallVector<CVPipeline::CubePageLoader>> chains) {
+  llvm::MapVector<Block *, llvm::SetVector<Operation *>> candidates;
+  for (const auto &pages : chains) {
+    for (auto page : pages) {
+      Block *block = page.copy->getBlock();
+      SmallVector<Value> worklist{page.copy.getSource()};
+      llvm::SmallPtrSet<Operation *, 32> visited;
+      while (!worklist.empty()) {
+        Operation *op = worklist.pop_back_val().getDefiningOp();
+        if (!op || op->getBlock() != block || !visited.insert(op).second)
+          continue;
+        if (isa<scf::IfOp>(op)) {
+          candidates[block].insert(op);
+          continue;
+        }
+        if (isMemoryEffectFree(op))
+          llvm::append_range(worklist, op->getOperands());
+      }
+    }
+  }
+  for (auto &[block, ifOps] : candidates) {
+    auto loop = dyn_cast<scf::ForOp>(block->getParentOp());
+    if (!loop || loop->hasAttr("unsignedCmp"))
+      continue;
+    SmallVector<Operation *> ordered(ifOps.begin(), ifOps.end());
+    llvm::sort(ordered, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    struct SafeRead {
+      memref::ReinterpretCastOp view;
+      Operation *after;
+    };
+    SmallVector<SafeRead> safeReads;
+    AliasAnalysis aliases(loop->getParentOp());
+    for (Operation *op : ordered) {
+      auto metadata = getMaskedMetadataLoad(cast<scf::IfOp>(op));
+      if (!metadata)
+        continue;
+      auto [ifOp, load, view, other] = *metadata;
+      bool active = isTrueInLoop(ifOp.getCondition(), loop, aliases);
+      SafeRead *safe = nullptr;
+      if (!active) {
+        for (auto &read : llvm::reverse(safeReads)) {
+          if (read.view.getSource() != view.getSource() ||
+              read.view.getType() != view.getType())
+            continue;
+          bool clobbered = false;
+          for (Operation *between = read.after->getNextNode(); between != op;
+               between = between->getNextNode()) {
+            if (mayModifyOrFree(between, view.getSource(), aliases)) {
+              clobbered = true;
+              break;
+            }
+          }
+          if (!clobbered) {
+            safe = &read;
+            break;
+          }
+        }
+        if (!safe)
+          continue;
+      }
+      OpBuilder builder(ifOp);
+      IRMapping mapping;
+      for (Operation &addressOp :
+           ifOp.getThenRegion().front().without_terminator()) {
+        if (&addressOp == load || &addressOp == view)
+          continue;
+        copyBlockAssignment(ifOp, builder.clone(addressOp, mapping));
+      }
+      OpFoldResult offset = view.getMixedOffsets()[0];
+      if (auto value = dyn_cast<Value>(offset))
+        offset = mapping.lookupOrDefault(value);
+      if (!active) {
+        Value wanted =
+            getValueOrCreateConstantIndexOp(builder, ifOp.getLoc(), offset);
+        Value fallback = getValueOrCreateConstantIndexOp(
+            builder, ifOp.getLoc(), safe->view.getMixedOffsets()[0]);
+        auto selected = builder.create<arith::SelectOp>(
+            ifOp.getLoc(), ifOp.getCondition(), wanted, fallback);
+        copyBlockAssignment(ifOp, selected);
+        offset = selected.getResult();
+      }
+      auto safeView = builder.create<memref::ReinterpretCastOp>(
+          view.getLoc(), view.getType(), view.getSource(), offset,
+          view.getMixedSizes(), view.getMixedStrides());
+      copyBlockAssignment(ifOp, safeView);
+      auto scalar = builder.create<memref::LoadOp>(
+          load.getLoc(), safeView,
+          mapping.lookupOrDefault(load.getIndices()[0]));
+      scalar->setAttrs(load->getAttrs());
+      copyBlockAssignment(ifOp, scalar);
+      Value result = scalar;
+      if (active) {
+        safeReads.push_back({safeView, scalar});
+      } else {
+        safe->after = scalar;
+        auto selected = builder.create<arith::SelectOp>(
+            ifOp.getLoc(), ifOp.getCondition(), result, other);
+        copyBlockAssignment(ifOp, selected);
+        result = selected;
+      }
+      ifOp.getResult(0).replaceAllUsesWith(result);
+      ifOp.erase();
+    }
+  }
+}
+
 void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
   auto root = pages.back().insert;
   auto type = root.getType();
@@ -246,22 +498,11 @@ void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
                                                   sizes, strides);
     tag(view);
     Value source = page.copy.getSource();
-    auto count = builder.create<memref::DimOp>(loc, source, 0);
-    tag(count);
-    auto c0 = builder.create<arith::ConstantIndexOp>(loc, 0);
-    tag(c0);
-    auto live = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::sgt,
-                                              count, c0);
-    tag(live);
-    auto guard = builder.create<scf::IfOp>(loc, live, false);
-    tag(guard);
-    builder.setInsertionPointToStart(&guard.getThenRegion().front());
     // ND2NZ uses the full aggregate's N-stride, so a short page writes only
-    // its own rows. The initial zero fill covers masked and sentinel pages.
+    // its own rows. The initial zero fill covers the remaining masked rows.
     auto load = builder.create<hivm::ND2NZOp>(loc, TypeRange{}, source, view,
                                               builder.getUnitAttr());
     tag(load);
-    tag(guard.thenYield());
   }
 
   builder.setInsertionPoint(root);
@@ -337,6 +578,7 @@ public:
     });
     if (CVPipeline::hasFallbackAttr(getOperation()))
       return;
+    simplifyMetadataMasks(chains);
     for (const auto &pages : chains)
       materializePages(pages);
   }
