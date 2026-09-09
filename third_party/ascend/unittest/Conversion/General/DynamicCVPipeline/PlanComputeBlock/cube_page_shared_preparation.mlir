@@ -10,34 +10,15 @@
 // UNSHARED-NOT: ssbuffer.shared_page_write
 // UNSHARED: return
 
-// RUN: sed 's/%%c0 to %%c3 step %%c1/%%c1 to %%c8 step %%c2/' %s | triton-opt --materialize-cube-page-loaders --verify-each | FileCheck %s --check-prefix=RING
-
-// Nonzero lower bounds and non-unit steps select slots by trip number.
-// RING-LABEL: func.func @shared_pages
-// RING: %[[ONE:.*]] = arith.constant 1 : index
-// RING: %[[TWO:.*]] = arith.constant 2 : index
-// RING: scf.for %[[IV:.*]] = %[[ONE]] to %{{.*}} step %[[TWO]]
-// RING: %[[REL:.*]] = arith.subi %[[IV]], %[[ONE]]
-// RING: %[[ITER:.*]] = arith.divsi %[[REL]], %[[TWO]]
-// RING: arith.remsi %[[ITER]]
-// RING: linalg.matmul
-// RING: %[[CREL:.*]] = arith.subi %[[IV]], %[[ONE]]
-// RING: %[[CITER:.*]] = arith.divsi %[[CREL]], %[[TWO]]
-// RING: arith.remsi %[[CITER]]
-// RING: linalg.matmul
-
 // K and V use the same two page descriptors but feed separate matmuls.
 // V is prepared with K; the second matmul consumes the shared L1 aggregate.
-// The shared allocation has two slots and one producer/consumer dependency.
-// The producer can run one tile ahead, but cannot overwrite an occupied slot.
+// One shared buffer is occupied until PV consumes it.
+// Metadata stays with its own K/V pair; no later page is prefetched.
 // MATERIAL-LABEL: func.func @shared_pages
-// MATERIAL: %[[VBUF:.*]] = memref.alloc() {{.*}}ssbuffer.block_id = 0 : i32{{.*}}memref<2x1x1x16x16xf16, #hivm.address_space<cbuf>>
+// MATERIAL: %[[VBUF:.*]] = memref.alloc() {{.*}}ssbuffer.block_id = 0 : i32{{.*}}memref<1x1x16x16xf16, #hivm.address_space<cbuf>>
 // MATERIAL: scf.for
-// MATERIAL: arith.subi
-// MATERIAL: arith.divsi
-// MATERIAL: arith.remsi
-// MATERIAL: %[[SLOT:.*]] = memref.subview %[[VBUF]]
-// MATERIAL: linalg.fill {{.*}}ssbuffer.block_id = 1 : i32{{.*}}ssbuffer.intraDeps = [0 : i32, 1 : i32]{{.*}}ssbuffer.shared_page_slots = 2 : i32{{.*}}ssbuffer.shared_page_write{{.*}}outs(%[[SLOT]]
+// MATERIAL-NOT: arith.remsi
+// MATERIAL: linalg.fill {{.*}}ssbuffer.block_id = 1 : i32{{.*}}ssbuffer.intraDeps = [0 : i32, 1 : i32]{{.*}}ssbuffer.shared_page_write{{.*}}outs(%[[VBUF]]
 // MATERIAL-COUNT-4: hivm.hir.nd2nz {{.*}}ssbuffer.block_id = 1 : i32
 // MATERIAL: linalg.matmul {{.*}}ssbuffer.block_id = 1 : i32
 // MATERIAL: memref.memory_space_cast {{.*}}ssbuffer.block_id = 3 : i32{{.*}}ssbuffer.intraDeps = [0 : i32, 0 : i32]
@@ -45,8 +26,11 @@
 // CLONE-LABEL: func.func @shared_pages
 // CLONE: scf.for
 // CLONE: memref.load
+// CLONE-NOT: memref.load
+// CLONE-COUNT-2: hivm.hir.nd2nz
 // CLONE: memref.load
-// CLONE-COUNT-4: hivm.hir.nd2nz
+// CLONE-NOT: memref.load
+// CLONE-COUNT-2: hivm.hir.nd2nz
 // CLONE: linalg.matmul {{.*}}ssbuffer.block_id = 1 : i32
 // CLONE-NOT: memref.load
 // CLONE-NOT: hivm.hir.nd2nz
@@ -54,15 +38,16 @@
 
 // CONDITION-LABEL: func.func @shared_pages
 // CONDITION: scf.for {{.*}}iter_args({{.*}}, %[[COUNT:.*]] = %{{.*}}) -> (index, index, i32)
-// CONDITION: %[[TWO:.*]] = arith.constant 2 : i32
-// CONDITION: arith.cmpi slt, %[[COUNT]], %[[TWO]] : i32
-// CONDITION: %[[PRODUCED:.*]]:2 = scf.if {{.*}} -> (index, i32)
+// CONDITION: arith.constant 1 : i32
+// CONDITION-NEXT: %[[ZERO:.*]] = arith.constant 0 : i32
+// CONDITION: arith.cmpi eq, %[[COUNT]], %[[ZERO]] : i32
+// CONDITION: %[[PRODUCED:.*]]:2 = scf.if {{.*}} -> (i32, index)
 // CONDITION: linalg.matmul {{.*}}ssbuffer.block_id = 1 : i32
 // CONDITION: arith.addi %[[COUNT]], %{{.*}} : i32
 // CONDITION: ssbuffer.if = 1 : i32
-// CONDITION: arith.cmpi sgt, %[[PRODUCED]]#1, %{{.*}} : i32
+// CONDITION: arith.cmpi sgt, %[[PRODUCED]]#0, %{{.*}} : i32
 // CONDITION: linalg.matmul {{.*}}ssbuffer.block_id = 3 : i32
-// CONDITION: arith.subi %[[PRODUCED]]#1, %{{.*}} : i32
+// CONDITION: arith.subi %[[PRODUCED]]#0, %{{.*}} : i32
 // CONDITION: ssbuffer.if = 3 : i32
 
 func.func @shared_pages(%metadata: memref<?xi32>, %k: memref<?xf16>, %v: memref<?xf16>, %q: tensor<16x16xf16>, %p: tensor<16x16xf16>) {

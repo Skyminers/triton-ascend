@@ -3,11 +3,10 @@
 module {
   // CHECK-LABEL: func.func @test_remove_shared_page_write
   // CHECK: linalg.fill ins
-  // CHECK-NOT: ssbuffer.shared_page_slots
   // CHECK-NOT: ssbuffer.shared_page_write
   // CHECK: return
   func.func @test_remove_shared_page_write(%buffer: memref<16xf16>, %zero: f16) {
-    linalg.fill {ssbuffer.shared_page_slots = 2 : i32, ssbuffer.shared_page_write} ins(%zero : f16) outs(%buffer : memref<16xf16>)
+    linalg.fill {ssbuffer.shared_page_write} ins(%zero : f16) outs(%buffer : memref<16xf16>)
     return
   }
 

@@ -910,15 +910,15 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
   }
   for (auto &group : outputGroups) {
     int size = group.outputs.size();
-    // Page preparation writes one dynamically selected slot of a shared L1
-    // ring. Its single producer represents several physical buffers.
-    if (size == 1) {
-      if (auto slots = group.outputs.front()->getAttrOfType<IntegerAttr>(
-              CVPipeline::kSharedPageSlots))
-        size = slots.getInt();
-    }
-    Value limitVal =
-        builder.create<arith::ConstantIntOp>(loc, size, CONST_INT_TYPE);
+    // A shared page buffer has one slot: only an empty buffer may be filled.
+    // Use an availability test, so downstream completion discovery does not
+    // confuse this non-monotonic occupancy with the loop progress counter.
+    bool sharedPage = size == 1 && group.outputs.front()->hasAttr(
+                                       CVPipeline::kSharedPageWrite);
+    auto predicate =
+        sharedPage ? arith::CmpIPredicate::eq : arith::CmpIPredicate::slt;
+    Value limitVal = builder.create<arith::ConstantIntOp>(
+        loc, sharedPage ? 0 : size, CONST_INT_TYPE);
     for (Value var : group.inputVars) {
       Value varToUse = var;
       auto latestIt = controlVarToLatestValue.find(var);
@@ -926,8 +926,8 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
         varToUse = latestIt->second;
       }
 
-      Value cond = builder.create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt,
-                                                 varToUse, limitVal);
+      Value cond =
+          builder.create<arith::CmpIOp>(loc, predicate, varToUse, limitVal);
       conditions.push_back(cond);
       usedVarsSet.insert(var);
       varUpdateTypes[var] = VarUpdateType::INC;
@@ -1161,6 +1161,22 @@ int UpdateConditionInfoPass::setFlowOptCondition(scf::IfOp currentIfOp,
 
   // Get the start node
   scf::IfOp sourceIfOp = info->flowOptIfOpPairs[currentIfOp];
+  // Shared V has one slot. Waiting for multiple QK iterations before PV
+  // would deadlock: QK cannot reuse that slot until PV consumes it. The
+  // existing cross-core and intra-core conditions already ensure readiness.
+  auto depsIt = info->intraCoreDependentMap.find(loopOp);
+  if (depsIt != info->intraCoreDependentMap.end()) {
+    for (auto &entry : depsIt->second) {
+      if (!currentIfOp->isAncestor(entry.first) || entry.second.size() != 1)
+        continue;
+      Operation *producer = entry.second.front();
+      if (producer->hasAttr(CVPipeline::kSharedPageWrite) &&
+          sourceIfOp->isAncestor(producer)) {
+        flowOptCond = nullptr;
+        return UPDATE_CONDITION_INFO_SUCCESS;
+      }
+    }
+  }
   if (!info->cntArgs.count(sourceIfOp)) {
     LDBG("[Error] Start node has no counter in cntArgs, cannot build flowOpt "
          "condition. currentIfOp="
@@ -1253,14 +1269,14 @@ void UpdateConditionInfoPass::updateControlVarToLatestValue(scf::IfOp newIfOp,
 
   for (size_t i = 0; i < currentUsedVars.size(); ++i) {
     Value var = currentUsedVars[i];
-    Value newValue = newIfOp.getResult(origResultCount + hasCounter + i);
+    Value newValue = newIfOp.getResult(origResultCount + i);
     controlVarToLatestValue[var] = newValue;
     LDBG("Record latest intraCore control value at result index "
-         << (origResultCount + hasCounter + i) << "." << "\n");
+         << (origResultCount + i) << "." << "\n");
   }
 
   if (hasCounter) {
-    size_t counterResultIdx = origResultCount;
+    size_t counterResultIdx = origResultCount + currentUsedVars.size();
     Value newCounterValue = newIfOp.getResult(counterResultIdx);
     controlVarToLatestValue[counter] = newCounterValue;
     LDBG("Record latest counter value at result index " << counterResultIdx
@@ -1459,15 +1475,11 @@ UpdateConditionInfoPass::buildNewIfResultTypes(scf::IfOp oldIfOp,
   for (Value result : oldIfOp.getResults()) {
     resultTypes.push_back(result.getType());
   }
-  // Keep monotonic progress ahead of queue occupancies in the scheduling
-  // results. Downstream guard scheduling discovers completion from a yielded
-  // value compared with a bound; an occupancy is also bounded, but can decrease
-  // after consumption and must never serve as the loop completion counter.
-  if (hasCounter) {
-    resultTypes.push_back(counter.getType());
-  }
   for (Value var : currentUsedVars) {
     resultTypes.push_back(var.getType());
+  }
+  if (hasCounter) {
+    resultTypes.push_back(counter.getType());
   }
   LDBG("Build new if result types: old results "
        << oldIfOp.getNumResults() << ", control vars " << currentUsedVars.size()
@@ -1540,8 +1552,7 @@ void UpdateConditionInfoPass::populateNewThenBlock(
 
   if (hasCounter) {
     Value newCounter = thenBuilder.create<arith::AddIOp>(loc, counter, step);
-    thenYieldOperands.insert(
-        thenYieldOperands.begin() + oldYieldOperands.size(), newCounter);
+    thenYieldOperands.push_back(newCounter);
     LDBG("Append updated counter to then yield." << "\n");
   }
 
@@ -1598,8 +1609,7 @@ void UpdateConditionInfoPass::populateNewElseBlock(scf::IfOp newIfOp,
     if (it != controlVarToLatestValue.end()) {
       counterToUse = it->second;
     }
-    elseYieldOperands.insert(
-        elseYieldOperands.begin() + oldElseYieldOperands.size(), counterToUse);
+    elseYieldOperands.push_back(counterToUse);
   }
 
   LDBG("Create else yield with " << elseYieldOperands.size() << " operands."

@@ -513,12 +513,6 @@ bool canSharePreparation(ArrayRef<CVPipeline::CubePageLoader> first,
       first.size() != second.size() || !firstRoot->hasOneUse() ||
       !secondRoot->hasOneUse())
     return false;
-  // Keep the extra L1 capacity bounded. Larger aggregates retain independent
-  // preparation rather than serializing the pipeline through one shared slot.
-  if (firstRoot.getType().getNumElements() *
-          firstRoot.getType().getElementTypeBitWidth() / 8 >
-      64 * 1024)
-    return false;
   auto producerId = firstRoot->getAttr(CVPipeline::kBlockId);
   auto consumerId = secondRoot->getAttr(CVPipeline::kBlockId);
   if (!producerId || !consumerId || producerId == consumerId)
@@ -715,77 +709,17 @@ void sharePagePreparation(MaterializedPages &first, MaterializedPages &second,
     loop->setAttr(CVPipeline::kBlockId,
                   builder.getI32IntegerAttr(CVPipeline::getAvailableBlockId(
                       loop->getParentOfType<ModuleOp>())));
-  // Two shared V slots let preparation advance while PV consumes the previous
-  // tile. Producer and consumer select using their own logical iteration;
-  // ProcessArgs later remaps the loop IV to each compute block's counter.
-  auto forOp = cast<scf::ForOp>(loop);
-  auto type = second.buffer.getType();
-  SmallVector<int64_t> shape{2};
-  llvm::append_range(shape, type.getShape());
-  auto storageType = MemRefType::get(shape, type.getElementType(), nullptr,
-                                     type.getMemorySpace());
-  auto storage = builder.create<memref::AllocOp>(loop->getLoc(), storageType);
-  storage->setAttr(CVPipeline::kBlockId, loop->getAttr(CVPipeline::kBlockId));
-  storage->setAttr(CVPipeline::kCoreType, builder.getStringAttr("CUBE"));
+  // One shared V aggregate, protected by the existing C2C producer/consumer
+  // counters. The producer cannot start another iteration until PV consumes V.
+  second.buffer->moveBefore(loop);
+  second.buffer->setAttr(CVPipeline::kBlockId,
+                         loop->getAttr(CVPipeline::kBlockId));
   second.zero->moveBefore(first.loads.front());
   second.fill->moveBefore(first.loads.front());
   second.zero->setAttr(CVPipeline::kBlockId, producerId);
   second.fill->setAttr(CVPipeline::kBlockId, producerId);
   second.fill->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
-  second.fill->setAttr(CVPipeline::kSharedPageSlots,
-                       builder.getI32IntegerAttr(2));
-  auto selectSlot = [&](Operation *before, Attribute blockId) -> Value {
-    builder.setInsertionPoint(before);
-    auto tag = [&](Operation *op) {
-      op->setAttr(CVPipeline::kBlockId, blockId);
-      op->setAttr(CVPipeline::kCoreType, builder.getStringAttr("CUBE"));
-    };
-    Location loc = before->getLoc();
-    auto relative = builder.create<arith::SubIOp>(loc, forOp.getInductionVar(),
-                                                  forOp.getLowerBound());
-    tag(relative);
-    auto iteration =
-        builder.create<arith::DivSIOp>(loc, relative, forOp.getStep());
-    tag(iteration);
-    auto two = builder.create<arith::ConstantOp>(
-        loc, builder.getIntegerAttr(iteration.getType(), 2));
-    tag(two);
-    auto slot = builder.create<arith::RemSIOp>(loc, iteration, two);
-    tag(slot);
-    Value index = slot;
-    if (!index.getType().isIndex()) {
-      auto cast = builder.create<arith::IndexCastOp>(
-          loc, builder.getIndexType(), index);
-      tag(cast);
-      index = cast;
-    }
-    SmallVector<OpFoldResult> offsets{index}, sizes{builder.getIndexAttr(1)};
-    SmallVector<OpFoldResult> strides(shape.size(), builder.getIndexAttr(1));
-    for (int64_t dim : type.getShape()) {
-      offsets.push_back(builder.getIndexAttr(0));
-      sizes.push_back(builder.getIndexAttr(dim));
-    }
-    auto viewType = memref::SubViewOp::inferRankReducedResultType(
-        type.getShape(), storageType, offsets, sizes, strides);
-    auto view = builder.create<memref::SubViewOp>(
-        loc, cast<MemRefType>(viewType), storage, offsets, sizes, strides);
-    tag(view);
-    return view;
-  };
-  Value producerSlot = selectSlot(second.fill, producerId);
-  Operation *layout = second.reader.getSource().getDefiningOp();
-  Value consumerSlot = selectSlot(layout, consumerId);
-  second.buffer.replaceAllUsesWith(producerSlot);
-  layout->setOperand(0, consumerSlot);
-  for (Operation *user : producerSlot.getUsers()) {
-    if (auto view = dyn_cast<memref::SubViewOp>(user))
-      view.getResult().setType(memref::SubViewOp::inferResultType(
-          view.getSourceType(), view.getMixedOffsets(), view.getMixedSizes(),
-          view.getMixedStrides()));
-  }
-  second.buffer.erase();
-  second.buffer = storage;
-  // One producer marker denotes the ring, not one marker per page DMA.
+  // One producer marker denotes one buffer, not one marker per page DMA.
   second.fill->setAttr(
       CVPipeline::kIntraDeps,
       builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreProducerId}));
@@ -796,96 +730,6 @@ void sharePagePreparation(MaterializedPages &first, MaterializedPages &second,
     Operation *after = left;
     movePagePreparation(right, after, producerId, consumerId);
     right->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
-  }
-}
-
-// Collect only the address computation of a scalar read. Stop at definitions
-// already available at the insertion point; never speculate another read or
-// move an operation from another compute block.
-bool collectEarlyAddress(Value value, Operation *before, Attribute blockId,
-                         llvm::SetVector<Operation *> &ops) {
-  Operation *op = value.getDefiningOp();
-  if (!op || op->getBlock() != before->getBlock() ||
-      op->isBeforeInBlock(before))
-    return true;
-  if (op == before || op->getNumRegions() ||
-      op->getAttr(CVPipeline::kBlockId) != blockId || !isMemoryEffectFree(op) ||
-      !isSpeculatable(op))
-    return false;
-  if (ops.contains(op))
-    return true;
-  for (Value operand : op->getOperands())
-    if (!collectEarlyAddress(operand, before, blockId, ops))
-      return false;
-  ops.insert(op);
-  return true;
-}
-
-// Static page offsets let a small group of metadata reads precede their DMA
-// consumers. Only keep four scalar results live, rather than all descriptors
-// and decoded addresses of a fully unrolled tile. This exposes independent
-// reads to the backend without changing the payload DMA order.
-void schedulePageMetadata(const MaterializedPages &pages) {
-  constexpr unsigned window = 4;
-  AliasAnalysis aliases(pages.buffer->getParentOfType<func::FuncOp>());
-  for (unsigned begin = 0; begin < pages.loads.size(); begin += window) {
-    llvm::SetVector<Operation *> reads;
-    for (unsigned i = begin;
-         i < std::min<unsigned>(begin + window, pages.loads.size()); ++i) {
-      auto dma = pages.loads[i];
-      SmallVector<Value> worklist{dma.getSrc()};
-      llvm::SmallPtrSet<Operation *, 32> visited;
-      while (!worklist.empty()) {
-        Operation *op = worklist.pop_back_val().getDefiningOp();
-        if (!op || op->getBlock() != dma->getBlock() ||
-            !visited.insert(op).second)
-          continue;
-        if (auto load = dyn_cast<memref::LoadOp>(op)) {
-          if (load.getType().isInteger(32) && isGMSource(load.getMemRef()) &&
-              !load->hasAttr("volatile") &&
-              load->getAttr(CVPipeline::kBlockId) ==
-                  dma->getAttr(CVPipeline::kBlockId) &&
-              llvm::none_of(load->getUsers(), [](Operation *user) {
-                return isa<annotation::MarkOp>(user);
-              }))
-            reads.insert(op);
-          continue;
-        }
-        if (isMemoryEffectFree(op) && !op->getNumRegions())
-          llvm::append_range(worklist, op->getOperands());
-      }
-    }
-    if (reads.size() < 2 || reads.size() > window)
-      continue;
-    SmallVector<Operation *> ordered(reads.begin(), reads.end());
-    llvm::sort(ordered, [](Operation *a, Operation *b) {
-      return a->isBeforeInBlock(b);
-    });
-    Operation *before = ordered.front()->getNextNode();
-    for (Operation *op : llvm::drop_begin(ordered)) {
-      auto load = cast<memref::LoadOp>(op);
-      if (op == before || op->isBeforeInBlock(before))
-        continue;
-      llvm::SetVector<Operation *> address;
-      if (!llvm::all_of(op->getOperands(), [&](Value operand) {
-            return collectEarlyAddress(
-                operand, before, op->getAttr(CVPipeline::kBlockId), address);
-          }))
-        continue;
-      bool clobbered = false;
-      for (Operation *between = before; between != op;
-           between = between->getNextNode()) {
-        if (mayModifyOrFree(between, load.getMemRef(), aliases)) {
-          clobbered = true;
-          break;
-        }
-      }
-      if (clobbered)
-        continue;
-      for (Operation *dependency : address)
-        dependency->moveBefore(before);
-      op->moveBefore(before);
-    }
   }
 }
 
@@ -958,8 +802,6 @@ public:
     for (auto [first, second] : shared)
       sharePagePreparation(materialized[first], materialized[second],
                            groupId++);
-    for (const auto &pages : materialized)
-      schedulePageMetadata(pages);
   }
 };
 
