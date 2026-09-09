@@ -451,7 +451,143 @@ void simplifyMetadataMasks(
   }
 }
 
-void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
+// Only share preparation whose scalar GM reads are already shared in SSA.
+// In particular, a V address derived from QK/softmax must not move before QK.
+bool collectPagePreparation(Value value, Block *body,
+                            llvm::SetVector<Operation *> &ops,
+                            llvm::DenseSet<Operation *> &reads) {
+  auto *op = value.getDefiningOp();
+  if (!op) {
+    auto arg = cast<BlockArgument>(value);
+    if (arg.getOwner() != body)
+      return true;
+    auto loop = dyn_cast<scf::ForOp>(body->getParentOp());
+    return loop && value == loop.getInductionVar();
+  }
+  if (op->getBlock() != body)
+    return !body->findAncestorOpInBlock(*op);
+  if (!ops.insert(op))
+    return true;
+
+  bool valid = true;
+  op->walk([&](Operation *nested) {
+    for (Value result : nested->getResults()) {
+      if (!result.getType().isIntOrIndexOrFloat() &&
+          !(isa<MemRefType>(result.getType()) && isGMSource(result)))
+        valid = false;
+    }
+    if (auto load = dyn_cast<memref::LoadOp>(nested)) {
+      if (!load.getType().isIntOrIndexOrFloat() ||
+          !isGMSource(load.getMemRef()) || load->hasAttr("volatile") ||
+          llvm::any_of(load->getUsers(), [](Operation *user) {
+            return isa<annotation::MarkOp>(user);
+          }))
+        valid = false;
+      reads.insert(load);
+    } else if (!isa<scf::IfOp, scf::YieldOp>(nested) &&
+               !isMemoryEffectFree(nested)) {
+      valid = false;
+    }
+    if (nested->getNumRegions() && !isa<scf::IfOp>(nested))
+      valid = false;
+    for (Value operand : nested->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (def && (def == op || op->isProperAncestor(def)))
+        continue;
+      if (!collectPagePreparation(operand, body, ops, reads))
+        valid = false;
+    }
+  });
+  return valid;
+}
+
+bool canSharePreparation(ArrayRef<CVPipeline::CubePageLoader> first,
+                         ArrayRef<CVPipeline::CubePageLoader> second) {
+  auto firstRoot = first.back().insert;
+  auto secondRoot = second.back().insert;
+  Block *body = firstRoot->getBlock();
+  auto loop = dyn_cast<scf::ForOp>(body->getParentOp());
+  if (!loop || secondRoot->getBlock() != body ||
+      !firstRoot->isBeforeInBlock(secondRoot) ||
+      firstRoot.getType() != secondRoot.getType() ||
+      first.size() != second.size() || !firstRoot->hasOneUse() ||
+      !secondRoot->hasOneUse())
+    return false;
+  // Keep the extra L1 capacity bounded. Larger aggregates retain independent
+  // preparation rather than serializing the pipeline through one shared slot.
+  if (firstRoot.getType().getNumElements() *
+          firstRoot.getType().getElementTypeBitWidth() / 8 >
+      64 * 1024)
+    return false;
+  auto producerId = firstRoot->getAttr(CVPipeline::kBlockId);
+  auto consumerId = secondRoot->getAttr(CVPipeline::kBlockId);
+  if (!producerId || !consumerId || producerId == consumerId)
+    return false;
+  if ((*firstRoot->getUsers().begin())->getAttr(CVPipeline::kBlockId) !=
+          producerId ||
+      (*secondRoot->getUsers().begin())->getAttr(CVPipeline::kBlockId) !=
+          consumerId)
+    return false;
+  // MarkMainLoop keeps only innermost pipeline loops. Sharing in an outer
+  // loop would otherwise lose the counter that protects this buffer.
+  bool nestedLoop = false;
+  loop.walk([&](Operation *op) {
+    if (op != loop && isa<scf::ForOp, scf::WhileOp>(op))
+      nestedLoop = true;
+  });
+  if (nestedLoop)
+    return false;
+  AliasAnalysis aliases(loop->getParentOp());
+  for (unsigned i = 0; i < first.size(); ++i) {
+    auto left = first[i];
+    auto right = second[i];
+    if (left.insert.getStaticOffsets() != right.insert.getStaticOffsets() ||
+        left.insert.getSourceType() != right.insert.getSourceType())
+      return false;
+    llvm::SetVector<Operation *> leftOps, rightOps;
+    llvm::DenseSet<Operation *> leftReads, rightReads;
+    if (!collectPagePreparation(left.copy.getSource(), body, leftOps,
+                                leftReads) ||
+        !collectPagePreparation(right.copy.getSource(), body, rightOps,
+                                rightReads) ||
+        leftReads.empty() || leftReads != rightReads)
+      return false;
+    // Sharing also moves the payload read. The common descriptor alone does
+    // not prove that V was not modified between its old and new positions.
+    if (!left.copy->isBeforeInBlock(right.copy))
+      return false;
+    for (Operation *between = left.copy; between != right.copy;
+         between = between->getNextNode()) {
+      if (mayModifyOrFree(between, right.copy.getSource(), aliases))
+        return false;
+    }
+    for (Operation *op : rightOps) {
+      auto id = op->getAttr(CVPipeline::kBlockId);
+      if (id != producerId && id != consumerId &&
+          !op->isBeforeInBlock(first.front().copy))
+        return false;
+      if (id != consumerId)
+        continue;
+      for (Operation *user : op->getUsers()) {
+        auto *child = body->findAncestorOpInBlock(*user);
+        if (!child || child->getAttr(CVPipeline::kBlockId) != consumerId)
+          return false;
+      }
+    }
+  }
+  return true;
+}
+
+struct MaterializedPages {
+  memref::AllocOp buffer;
+  arith::ConstantOp zero;
+  linalg::FillOp fill;
+  memref::MemorySpaceCastOp reader;
+  SmallVector<hivm::ND2NZOp> loads;
+};
+
+MaterializedPages materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
+  MaterializedPages result;
   auto root = pages.back().insert;
   auto type = root.getType();
   int64_t rows = type.getDimSize(0), cols = type.getDimSize(1);
@@ -478,12 +614,15 @@ void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
       firstCopy = page.copy;
   builder.setInsertionPoint(firstCopy);
   auto aggregate = builder.create<memref::AllocOp>(loc, nzType);
+  result.buffer = aggregate;
   tag(aggregate);
   auto zero = builder.create<arith::ConstantOp>(
       loc, builder.getZeroAttr(type.getElementType()));
+  result.zero = zero;
   tag(zero);
   auto fill = builder.create<linalg::FillOp>(loc, ValueRange{zero},
                                              ValueRange{aggregate});
+  result.fill = fill;
   tag(fill);
 
   for (auto page : pages) {
@@ -503,6 +642,7 @@ void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
     auto load = builder.create<hivm::ND2NZOp>(loc, TypeRange{}, source, view,
                                               builder.getUnitAttr());
     tag(load);
+    result.loads.push_back(load);
   }
 
   builder.setInsertionPoint(root);
@@ -517,6 +657,7 @@ void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
       loc, MemRefType::get(type.getShape(), type.getElementType()),
       layout.getResult());
   tag(cast);
+  result.reader = cast;
   auto tensor =
       builder.create<bufferization::ToTensorOp>(loc, type, cast, true, true);
   tag(tensor);
@@ -535,6 +676,217 @@ void materializePages(ArrayRef<CVPipeline::CubePageLoader> pages) {
   for (Operation *op : cleanup)
     if (isa<scf::IfOp>(op) && isOpTriviallyDead(op))
       op->erase();
+  return result;
+}
+
+// Move a validated page's address/guard operations next to its sibling load.
+// Existing definitions before the insertion point stay in place.
+void movePagePreparation(Operation *op, Operation *&after, Attribute producerId,
+                         Attribute consumerId) {
+  Block *body = after->getBlock();
+  op->walk([&](Operation *nested) {
+    for (Value operand : nested->getOperands()) {
+      Operation *def = operand.getDefiningOp();
+      if (!def || def == op || op->isProperAncestor(def) ||
+          def->getBlock() != body)
+        continue;
+      if (def->getAttr(CVPipeline::kBlockId) == consumerId)
+        movePagePreparation(def, after, producerId, consumerId);
+    }
+  });
+  if (op->getAttr(CVPipeline::kBlockId) == consumerId) {
+    op->walk([&](Operation *nested) {
+      nested->setAttr(CVPipeline::kBlockId, producerId);
+    });
+    if (after->isBeforeInBlock(op)) {
+      op->moveAfter(after);
+      after = op;
+    }
+  }
+}
+
+void sharePagePreparation(MaterializedPages &first, MaterializedPages &second,
+                          int groupId) {
+  Operation *loop = first.buffer->getBlock()->getParentOp();
+  auto producerId = first.fill->getAttr(CVPipeline::kBlockId);
+  auto consumerId = second.fill->getAttr(CVPipeline::kBlockId);
+  OpBuilder builder(loop);
+  if (!loop->hasAttr(CVPipeline::kBlockId))
+    loop->setAttr(CVPipeline::kBlockId,
+                  builder.getI32IntegerAttr(CVPipeline::getAvailableBlockId(
+                      loop->getParentOfType<ModuleOp>())));
+  // Two shared V slots let preparation advance while PV consumes the previous
+  // tile. Producer and consumer select using their own logical iteration;
+  // ProcessArgs later remaps the loop IV to each compute block's counter.
+  auto forOp = cast<scf::ForOp>(loop);
+  auto type = second.buffer.getType();
+  SmallVector<int64_t> shape{2};
+  llvm::append_range(shape, type.getShape());
+  auto storageType = MemRefType::get(shape, type.getElementType(), nullptr,
+                                     type.getMemorySpace());
+  auto storage = builder.create<memref::AllocOp>(loop->getLoc(), storageType);
+  storage->setAttr(CVPipeline::kBlockId, loop->getAttr(CVPipeline::kBlockId));
+  storage->setAttr(CVPipeline::kCoreType, builder.getStringAttr("CUBE"));
+  second.zero->moveBefore(first.loads.front());
+  second.fill->moveBefore(first.loads.front());
+  second.zero->setAttr(CVPipeline::kBlockId, producerId);
+  second.fill->setAttr(CVPipeline::kBlockId, producerId);
+  second.fill->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
+  second.fill->setAttr(CVPipeline::kSharedPageSlots,
+                       builder.getI32IntegerAttr(2));
+  auto selectSlot = [&](Operation *before, Attribute blockId) -> Value {
+    builder.setInsertionPoint(before);
+    auto tag = [&](Operation *op) {
+      op->setAttr(CVPipeline::kBlockId, blockId);
+      op->setAttr(CVPipeline::kCoreType, builder.getStringAttr("CUBE"));
+    };
+    Location loc = before->getLoc();
+    auto relative = builder.create<arith::SubIOp>(loc, forOp.getInductionVar(),
+                                                  forOp.getLowerBound());
+    tag(relative);
+    auto iteration =
+        builder.create<arith::DivSIOp>(loc, relative, forOp.getStep());
+    tag(iteration);
+    auto two = builder.create<arith::ConstantOp>(
+        loc, builder.getIntegerAttr(iteration.getType(), 2));
+    tag(two);
+    auto slot = builder.create<arith::RemSIOp>(loc, iteration, two);
+    tag(slot);
+    Value index = slot;
+    if (!index.getType().isIndex()) {
+      auto cast = builder.create<arith::IndexCastOp>(
+          loc, builder.getIndexType(), index);
+      tag(cast);
+      index = cast;
+    }
+    SmallVector<OpFoldResult> offsets{index}, sizes{builder.getIndexAttr(1)};
+    SmallVector<OpFoldResult> strides(shape.size(), builder.getIndexAttr(1));
+    for (int64_t dim : type.getShape()) {
+      offsets.push_back(builder.getIndexAttr(0));
+      sizes.push_back(builder.getIndexAttr(dim));
+    }
+    auto viewType = memref::SubViewOp::inferRankReducedResultType(
+        type.getShape(), storageType, offsets, sizes, strides);
+    auto view = builder.create<memref::SubViewOp>(
+        loc, cast<MemRefType>(viewType), storage, offsets, sizes, strides);
+    tag(view);
+    return view;
+  };
+  Value producerSlot = selectSlot(second.fill, producerId);
+  Operation *layout = second.reader.getSource().getDefiningOp();
+  Value consumerSlot = selectSlot(layout, consumerId);
+  second.buffer.replaceAllUsesWith(producerSlot);
+  layout->setOperand(0, consumerSlot);
+  for (Operation *user : producerSlot.getUsers()) {
+    if (auto view = dyn_cast<memref::SubViewOp>(user))
+      view.getResult().setType(memref::SubViewOp::inferResultType(
+          view.getSourceType(), view.getMixedOffsets(), view.getMixedSizes(),
+          view.getMixedStrides()));
+  }
+  second.buffer.erase();
+  second.buffer = storage;
+  // One producer marker denotes the ring, not one marker per page DMA.
+  second.fill->setAttr(
+      CVPipeline::kIntraDeps,
+      builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreProducerId}));
+  second.reader->setAttr(
+      CVPipeline::kIntraDeps,
+      builder.getI32ArrayAttr({groupId, CVPipeline::crossCoreConsumerId}));
+  for (auto [left, right] : llvm::zip(first.loads, second.loads)) {
+    Operation *after = left;
+    movePagePreparation(right, after, producerId, consumerId);
+    right->setAttr(CVPipeline::kSharedPageWrite, builder.getUnitAttr());
+  }
+}
+
+// Collect only the address computation of a scalar read. Stop at definitions
+// already available at the insertion point; never speculate another read or
+// move an operation from another compute block.
+bool collectEarlyAddress(Value value, Operation *before, Attribute blockId,
+                         llvm::SetVector<Operation *> &ops) {
+  Operation *op = value.getDefiningOp();
+  if (!op || op->getBlock() != before->getBlock() ||
+      op->isBeforeInBlock(before))
+    return true;
+  if (op == before || op->getNumRegions() ||
+      op->getAttr(CVPipeline::kBlockId) != blockId || !isMemoryEffectFree(op) ||
+      !isSpeculatable(op))
+    return false;
+  if (ops.contains(op))
+    return true;
+  for (Value operand : op->getOperands())
+    if (!collectEarlyAddress(operand, before, blockId, ops))
+      return false;
+  ops.insert(op);
+  return true;
+}
+
+// Static page offsets let a small group of metadata reads precede their DMA
+// consumers. Only keep four scalar results live, rather than all descriptors
+// and decoded addresses of a fully unrolled tile. This exposes independent
+// reads to the backend without changing the payload DMA order.
+void schedulePageMetadata(const MaterializedPages &pages) {
+  constexpr unsigned window = 4;
+  AliasAnalysis aliases(pages.buffer->getParentOfType<func::FuncOp>());
+  for (unsigned begin = 0; begin < pages.loads.size(); begin += window) {
+    llvm::SetVector<Operation *> reads;
+    for (unsigned i = begin;
+         i < std::min<unsigned>(begin + window, pages.loads.size()); ++i) {
+      auto dma = pages.loads[i];
+      SmallVector<Value> worklist{dma.getSrc()};
+      llvm::SmallPtrSet<Operation *, 32> visited;
+      while (!worklist.empty()) {
+        Operation *op = worklist.pop_back_val().getDefiningOp();
+        if (!op || op->getBlock() != dma->getBlock() ||
+            !visited.insert(op).second)
+          continue;
+        if (auto load = dyn_cast<memref::LoadOp>(op)) {
+          if (load.getType().isInteger(32) && isGMSource(load.getMemRef()) &&
+              !load->hasAttr("volatile") &&
+              load->getAttr(CVPipeline::kBlockId) ==
+                  dma->getAttr(CVPipeline::kBlockId) &&
+              llvm::none_of(load->getUsers(), [](Operation *user) {
+                return isa<annotation::MarkOp>(user);
+              }))
+            reads.insert(op);
+          continue;
+        }
+        if (isMemoryEffectFree(op) && !op->getNumRegions())
+          llvm::append_range(worklist, op->getOperands());
+      }
+    }
+    if (reads.size() < 2 || reads.size() > window)
+      continue;
+    SmallVector<Operation *> ordered(reads.begin(), reads.end());
+    llvm::sort(ordered, [](Operation *a, Operation *b) {
+      return a->isBeforeInBlock(b);
+    });
+    Operation *before = ordered.front()->getNextNode();
+    for (Operation *op : llvm::drop_begin(ordered)) {
+      auto load = cast<memref::LoadOp>(op);
+      if (op == before || op->isBeforeInBlock(before))
+        continue;
+      llvm::SetVector<Operation *> address;
+      if (!llvm::all_of(op->getOperands(), [&](Value operand) {
+            return collectEarlyAddress(
+                operand, before, op->getAttr(CVPipeline::kBlockId), address);
+          }))
+        continue;
+      bool clobbered = false;
+      for (Operation *between = before; between != op;
+           between = between->getNextNode()) {
+        if (mayModifyOrFree(between, load.getMemRef(), aliases)) {
+          clobbered = true;
+          break;
+        }
+      }
+      if (clobbered)
+        continue;
+      for (Operation *dependency : address)
+        dependency->moveBefore(before);
+      op->moveBefore(before);
+    }
+  }
 }
 
 class MaterializeCubePageLoadersPass
@@ -579,8 +931,35 @@ public:
     if (CVPipeline::hasFallbackAttr(getOperation()))
       return;
     simplifyMetadataMasks(chains);
+    SmallVector<std::pair<unsigned, unsigned>> shared;
+    llvm::DenseSet<unsigned> paired;
+    for (unsigned i = 0; i < chains.size(); ++i) {
+      if (paired.contains(i))
+        continue;
+      for (unsigned j = i + 1; j < chains.size(); ++j) {
+        if (!paired.contains(j) && canSharePreparation(chains[i], chains[j])) {
+          shared.emplace_back(i, j);
+          paired.insert(i);
+          paired.insert(j);
+          break;
+        }
+      }
+    }
+    int groupId = 0;
+    getOperation().walk([&](Operation *op) {
+      auto deps = op->getAttrOfType<ArrayAttr>(CVPipeline::kIntraDeps);
+      if (deps && deps.size() == 2)
+        groupId = std::max(
+            groupId, static_cast<int>(cast<IntegerAttr>(deps[0]).getInt()) + 1);
+    });
+    SmallVector<MaterializedPages> materialized;
     for (const auto &pages : chains)
-      materializePages(pages);
+      materialized.push_back(materializePages(pages));
+    for (auto [first, second] : shared)
+      sharePagePreparation(materialized[first], materialized[second],
+                           groupId++);
+    for (const auto &pages : materialized)
+      schedulePageMetadata(pages);
   }
 };
 

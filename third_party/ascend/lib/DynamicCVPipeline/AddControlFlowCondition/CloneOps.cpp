@@ -134,6 +134,13 @@ cloneOpsForBlock(int curId, SmallVector<Operation *> &curOps,
   OpBuilder builder(curOps.front());
 
   for (Operation *op : toClone) {
+    // The consumer reads the producer's shared L1 buffer. Replaying these
+    // writes would also replay its page metadata loads in every consumer.
+    if (op->hasAttr(CVPipeline::kSharedPageWrite)) {
+      assert(op->getNumResults() == 0 &&
+             "shared page writes have no SSA results");
+      continue;
+    }
     Operation *cloned = cloneOpWithMapping(op, builder, valueMap);
     cloned->setAttr(CVPipeline::kBlockId, builder.getI32IntegerAttr(curId));
     if (auto origBlockIdOpt = CVPipeline::getOpBlockId(op)) {

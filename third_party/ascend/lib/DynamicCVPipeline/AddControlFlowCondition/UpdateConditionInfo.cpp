@@ -910,6 +910,13 @@ int UpdateConditionInfoPass::collectIntraCoreOutputConditions(
   }
   for (auto &group : outputGroups) {
     int size = group.outputs.size();
+    // Page preparation writes one dynamically selected slot of a shared L1
+    // ring. Its single producer represents several physical buffers.
+    if (size == 1) {
+      if (auto slots = group.outputs.front()->getAttrOfType<IntegerAttr>(
+              CVPipeline::kSharedPageSlots))
+        size = slots.getInt();
+    }
     Value limitVal =
         builder.create<arith::ConstantIntOp>(loc, size, CONST_INT_TYPE);
     for (Value var : group.inputVars) {
@@ -1246,14 +1253,14 @@ void UpdateConditionInfoPass::updateControlVarToLatestValue(scf::IfOp newIfOp,
 
   for (size_t i = 0; i < currentUsedVars.size(); ++i) {
     Value var = currentUsedVars[i];
-    Value newValue = newIfOp.getResult(origResultCount + i);
+    Value newValue = newIfOp.getResult(origResultCount + hasCounter + i);
     controlVarToLatestValue[var] = newValue;
     LDBG("Record latest intraCore control value at result index "
-         << (origResultCount + i) << "." << "\n");
+         << (origResultCount + hasCounter + i) << "." << "\n");
   }
 
   if (hasCounter) {
-    size_t counterResultIdx = origResultCount + currentUsedVars.size();
+    size_t counterResultIdx = origResultCount;
     Value newCounterValue = newIfOp.getResult(counterResultIdx);
     controlVarToLatestValue[counter] = newCounterValue;
     LDBG("Record latest counter value at result index " << counterResultIdx
@@ -1452,11 +1459,15 @@ UpdateConditionInfoPass::buildNewIfResultTypes(scf::IfOp oldIfOp,
   for (Value result : oldIfOp.getResults()) {
     resultTypes.push_back(result.getType());
   }
-  for (Value var : currentUsedVars) {
-    resultTypes.push_back(var.getType());
-  }
+  // Keep monotonic progress ahead of queue occupancies in the scheduling
+  // results. Downstream guard scheduling discovers completion from a yielded
+  // value compared with a bound; an occupancy is also bounded, but can decrease
+  // after consumption and must never serve as the loop completion counter.
   if (hasCounter) {
     resultTypes.push_back(counter.getType());
+  }
+  for (Value var : currentUsedVars) {
+    resultTypes.push_back(var.getType());
   }
   LDBG("Build new if result types: old results "
        << oldIfOp.getNumResults() << ", control vars " << currentUsedVars.size()
@@ -1529,7 +1540,8 @@ void UpdateConditionInfoPass::populateNewThenBlock(
 
   if (hasCounter) {
     Value newCounter = thenBuilder.create<arith::AddIOp>(loc, counter, step);
-    thenYieldOperands.push_back(newCounter);
+    thenYieldOperands.insert(
+        thenYieldOperands.begin() + oldYieldOperands.size(), newCounter);
     LDBG("Append updated counter to then yield." << "\n");
   }
 
@@ -1586,7 +1598,8 @@ void UpdateConditionInfoPass::populateNewElseBlock(scf::IfOp newIfOp,
     if (it != controlVarToLatestValue.end()) {
       counterToUse = it->second;
     }
-    elseYieldOperands.push_back(counterToUse);
+    elseYieldOperands.insert(
+        elseYieldOperands.begin() + oldElseYieldOperands.size(), counterToUse);
   }
 
   LDBG("Create else yield with " << elseYieldOperands.size() << " operands."
