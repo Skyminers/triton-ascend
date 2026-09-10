@@ -44,7 +44,6 @@
 #include "mlir/Support/LLVM.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
-#include "ascend/include/DynamicCVPipeline/ComputeBlockOpt/CubePageLoaders.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/ComputeBlockIdManager.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/OpClassifier.h"
 #include "ascend/include/DynamicCVPipeline/SplitDataflow/Utils.h"
@@ -241,28 +240,6 @@ void OpClassifierPass::matchToTensorPattern(Operation *def) {
   }
 }
 
-// static_range page loaders are unrolled into insert_slice chains before core
-// classification. Recognize the entire aggregation, including its initial
-// fill, so that both the copies and their scalar address calculations can be
-// assigned to CUBE. Reject chains containing actual tensor computation.
-void OpClassifierPass::matchInsertSlicePattern(Operation *def) {
-  auto pages =
-      CVPipeline::getCubePageLoaders(dyn_cast<tensor::InsertSliceOp>(def));
-  if (!pages) {
-    return;
-  }
-  for (const auto &page : *pages) {
-    if (isExtractedLoadStoreRelated(page.tensor)) {
-      return;
-    }
-  }
-  for (const auto &page : *pages) {
-    markCube(page.insert);
-    cubeSeeds.push_back(page.insert);
-    matchToTensorPattern(page.tensor);
-  }
-}
-
 // ============================================================================
 // Pattern: transpose → matmul (Upstream)
 // ============================================================================
@@ -313,9 +290,6 @@ void OpClassifierPass::matchTransposePattern(Operation *def) {
   auto operands = transposeOp->getOperands();
   for (const auto &op : operands) {
     auto defOp = op.getDefiningOp();
-    if (defOp) {
-      matchInsertSlicePattern(defOp);
-    }
     if (!shouldMarkCubeSeed(defOp) ||
         utils::getAnnotateOpWithAttr(op,
                                      hivm::kMayImplicitTransposeWithLastAxis)) {
@@ -582,7 +556,6 @@ int OpClassifierPass::patternMatchCUBE() {
         continue;
 
       matchToTensorPattern(def);
-      matchInsertSlicePattern(def);
       matchTransposePattern(def);
       matchFillPattern(def);
       matchEmptyPattern(def);
@@ -727,26 +700,6 @@ void OpClassifierPass::getUpstreamOpsWithMemoryDeps(
     }
     if (isScalarIterArgOp(operand)) {
       findIterArgUpstreamOps(operand, upstreamOps);
-    }
-  }
-  // Masked scalar metadata loads lower to scf.if. Follow the yielded scalars
-  // when tracing a CUBE address dependency, otherwise the load stays VECTOR
-  // even when all of the address arithmetic and page copies run on CUBE.
-  if (getCoreType(cur) == OP_CUBE_ONLY) {
-    if (auto ifOp = dyn_cast<scf::IfOp>(cur)) {
-      if (llvm::all_of(ifOp.getResults(),
-                       [](Value value) { return isScalarType(value); })) {
-        for (Region &region : ifOp->getRegions()) {
-          if (region.empty()) {
-            continue;
-          }
-          for (Value value : region.front().getTerminator()->getOperands()) {
-            if (Operation *def = value.getDefiningOp()) {
-              upstreamOps.push_back(def);
-            }
-          }
-        }
-      }
     }
   }
   if (!isa<bufferization::ToTensorOp>(cur)) {
