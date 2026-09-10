@@ -39,7 +39,11 @@ public:
 
   ComputeBlockOptPass() = default;
 
-  void getDependentDialects(DialectRegistry &registry) const override;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    mlir::linalg::registerTransformDialectExtension(registry);
+    mlir::linalg::registerTilingInterfaceExternalModels(registry);
+    mlir::scf::registerTransformDialectExtension(registry);
+  }
 
   void runOnOperation() override;
 
