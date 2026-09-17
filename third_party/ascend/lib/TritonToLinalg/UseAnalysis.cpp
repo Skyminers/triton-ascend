@@ -425,7 +425,9 @@ LogicalResult triton::runUseAnalysis(triton::FuncOp &funcOp) {
             })
             .Case<triton::PrintOp>([&](auto print) {})
             .Default([&](Operation *op) {
-              bool allMeta = true;
+              // A terminator has no results; that does not make its operands
+              // metadata. Loop-carried values already participate in dataflow.
+              bool allMeta = op->getNumResults() != 0;
               for (auto res : op->getResults()) {
                 auto resUse = solver.lookupState<UseInfo>(res);
                 if (resUse->type != UseType::MetaUse) {

@@ -165,3 +165,6 @@ __all__ = [
     # dot ops
     "dot",
 ]
+
+from .online_softmax import online_softmax_nz
+__all__.append("online_softmax_nz")

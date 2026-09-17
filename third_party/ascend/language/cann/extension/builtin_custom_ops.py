@@ -103,3 +103,24 @@ class _index_select:
         self.arg_type['start_offset'] = index.dtype
         self.arg_type['src_stride'] = index.dtype
         self.extra_attr = f"src_stride_len={len(src_stride)}"
+
+
+@register_custom_op
+class _online_softmax_nz:
+    """A5 SIMD online softmax; implemented in the AscendNPU-IR template library."""
+    name = '__builtin_online_softmax_nz'
+    core = CORE.VECTOR
+    pipe = PIPE.PIPE_V
+    mode = MODE.SIMD
+
+    def __init__(self, scores, m, indices, out=None):
+        assert scores.dtype == m.dtype == tl.float32
+        assert len(scores.type.shape) == 4, "scores must be rank-4 NZ16"
+        n1, m1, m0, n0 = scores.type.shape
+        assert (n1, m0, n0) == (16, 16, 16) and m1 in (2, 4, 8), \
+            "online_softmax_nz supports M=32/64/128, N=256"
+        assert m.type.shape == [m1 * 16]
+        assert indices.dtype == tl.uint8 and indices.type.shape == [256]
+        assert out is not None and len(out) == 3
+        assert out[0].dtype == tl.float8e4nv and out[0].type.shape == [8, m1, 16, 32]
+        assert all(x.dtype == tl.float32 and x.type.shape == [m1 * 16] for x in out[1:])
