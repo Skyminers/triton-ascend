@@ -140,6 +140,7 @@ void OpClassifierPass::initializePass(ModuleOp module) {
   opCoreTypes.clear();
   allOps.clear();
   cubeSeeds.clear();
+  fixpipeOutputCastOps.clear();
   vectorOnlyProducerCache.clear();
   inBroadcastChain.clear();
   CloneOpMap.clear();
@@ -522,6 +523,27 @@ void OpClassifierPass::matchMaterializePattern(Operation *user) {
   cubeSeeds.push_back(user);
 }
 
+// Keep every FIXPIPE-representable output cast on CUBE, independent of the
+// downstream assembly/consumer topology. The shared capability matcher accepts
+// direct casts and supported output-layout conversions, and does not require the
+// matmul or layout value to have a single use.
+void OpClassifierPass::matchFixpipeOutputCastPatterns() {
+  for (Operation *op : allOps) {
+    auto info = CVPipeline::matchFixpipeOutputCast(op);
+    if (!info)
+      continue;
+
+    if (info->layoutOp)
+      markCube(info->layoutOp);
+    if (info->scaleSplatOp)
+      markCube(info->scaleSplatOp);
+    if (info->scaleOp)
+      markCube(info->scaleOp);
+    markCube(info->castOp);
+    fixpipeOutputCastOps.insert(info->castOp);
+  }
+}
+
 // Pattern matching for CUBE operations
 int OpClassifierPass::patternMatchCUBE() {
   LOG_DEBUG("--- Step 1: pattern match --->\n");
@@ -620,6 +642,8 @@ int OpClassifierPass::patternMatchCUBE() {
       }
     }
   }
+
+  matchFixpipeOutputCastPatterns();
 
   LLVM_DEBUG(DBGS() << "seeds: " << cubeSeeds.size() << " to_tensor(s)\n");
   for (Operation *seed : cubeSeeds) {
@@ -1048,6 +1072,14 @@ int OpClassifierPass::propagateVectorUpstream() {
     for (Operation *def : upstreamOps) {
       if (!def || vecVisited.count(def))
         continue;
+
+      // FIXPIPE emits a matched output cast as part of the producer transfer.
+      // Its VECTOR consumer is the boundary, not a reason to clone the cast onto
+      // VECTOR. This applies to any downstream topology accepted by the shared
+      // capability matcher (slice assembly, elementwise users, stores, etc.).
+      if (fixpipeOutputCastOps.contains(def)) {
+        continue;
+      }
 
       // Skip operations that should not be marked VECTOR:
       // - matmul: never mark matmul as vector (CUBE-only operation)

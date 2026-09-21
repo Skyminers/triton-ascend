@@ -9,6 +9,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include "bishengir/Dialect/HACC/Utils/Utils.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -516,6 +517,119 @@ std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
   if (inElemType.isInteger(32) && outElemType.isInteger(8))
     return hivm::FixpipePreQuantMode::S322I8;
   return std::nullopt;
+}
+
+std::optional<FixpipeOutputCastInfo>
+matchFixpipeOutputCast(Operation *castOp) {
+  if (!castOp)
+    return std::nullopt;
+  auto preQuantMode = getFixpipePreQuantMode(castOp);
+  if (!preQuantMode || castOp->getNumOperands() != 1 ||
+      castOp->getNumResults() != 1)
+    return std::nullopt;
+
+  auto castInputType =
+      dyn_cast<RankedTensorType>(castOp->getOperand(0).getType());
+  auto castOutputType = dyn_cast<RankedTensorType>(castOp->getResult(0).getType());
+  if (!castInputType || !castOutputType || !castInputType.hasStaticShape() ||
+      !castOutputType.hasStaticShape() ||
+      castInputType.getShape() != castOutputType.getShape())
+    return std::nullopt;
+
+  Value producerValue = castOp->getOperand(0);
+  Operation *layoutOp = nullptr;
+  arith::MulFOp scaleOp;
+  linalg::FillOp scaleSplatOp;
+  Value quantScale;
+
+  // FIXPIPE accepts one scalar f32 scale. Tensor lowering represents that scale
+  // as linalg.fill(scalar) followed by a no-fastmath elementwise multiply.
+  auto matchScalarSplat = [](Value value, Value data)
+      -> std::optional<std::pair<linalg::FillOp, Value>> {
+    auto fill = value.getDefiningOp<linalg::FillOp>();
+    if (!fill || fill.getInputs().size() != 1 ||
+        fill.getOutputs().size() != 1 || fill->getNumResults() != 1 ||
+        fill.getResult(0) != value || value.getType() != data.getType() ||
+        fill.getOutputs()[0].getType() != value.getType())
+      return std::nullopt;
+    Value scalar = fill.getInputs()[0];
+    if (!scalar.getType().isF32())
+      return std::nullopt;
+    return std::make_pair(fill, scalar);
+  };
+
+  // Layout conversion and scalar scaling commute for this FIXPIPE operation, so
+  // accept either ordering while allowing at most one of each operation.
+  for (unsigned i = 0; i != 2; ++i) {
+    if (!scaleOp) {
+      if (auto mul = producerValue.getDefiningOp<arith::MulFOp>()) {
+        if (mul.getFastmath() != arith::FastMathFlags::none)
+          return std::nullopt;
+        auto lhsScale = matchScalarSplat(mul.getLhs(), mul.getRhs());
+        auto rhsScale = matchScalarSplat(mul.getRhs(), mul.getLhs());
+        if (lhsScale.has_value() == rhsScale.has_value())
+          return std::nullopt;
+        auto scale = lhsScale ? *lhsScale : *rhsScale;
+        scaleOp = mul;
+        scaleSplatOp = scale.first;
+        quantScale = scale.second;
+        producerValue = lhsScale ? mul.getRhs() : mul.getLhs();
+        continue;
+      }
+    }
+
+    if (!layoutOp) {
+      if (auto convert =
+              producerValue.getDefiningOp<hivm::ConvertLayoutOp>()) {
+        auto srcType = dyn_cast<RankedTensorType>(convert.getSource().getType());
+        auto dstType = dyn_cast<RankedTensorType>(convert.getType());
+        auto fractalSizes = convert.getDstLayout().getFractalSizes();
+        if (!srcType || !dstType || !srcType.hasStaticShape() ||
+            !dstType.hasStaticShape() || srcType.getRank() != 2 ||
+            dstType.getRank() != 4 ||
+            convert.getSrcLayout().getTransposeValue().value_or(false) ||
+            convert.getDstLayout().getTransposeValue().value_or(false) ||
+            convert.getSrcLayout().getDataLayout() != hivm::DataLayout::ND ||
+            convert.getDstLayout().getDataLayout() !=
+                hivm::DataLayout::Fractal ||
+            !fractalSizes ||
+            fractalSizes.asArrayRef() != ArrayRef<int64_t>({16, 16}))
+          return std::nullopt;
+
+        int64_t m = srcType.getDimSize(0);
+        int64_t n = srcType.getDimSize(1);
+        if (m % 16 != 0 || n % 16 != 0 ||
+            dstType.getShape() !=
+                ArrayRef<int64_t>({n / 16, m / 16, 16, 16}))
+          return std::nullopt;
+
+        layoutOp = convert;
+        producerValue = convert.getSource();
+        continue;
+      }
+    }
+    break;
+  }
+
+  auto matmulOp = producerValue.getDefiningOp<linalg::MatmulOp>();
+  auto matmulType = matmulOp
+                        ? dyn_cast<RankedTensorType>(matmulOp.getResult(0).getType())
+                        : RankedTensorType{};
+  if (!matmulOp || !matmulType || !matmulType.hasStaticShape() ||
+      matmulType.getRank() != 2 || !matmulType.getElementType().isF32())
+    return std::nullopt;
+
+  if (scaleOp) {
+    auto module = castOp->getParentOfType<ModuleOp>();
+    if (*preQuantMode != hivm::FixpipePreQuantMode::F322F16 || !module ||
+        !hacc::utils::isAscend950(module))
+      return std::nullopt;
+    preQuantMode = hivm::FixpipePreQuantMode::QF322F16_PRE;
+  }
+
+  return FixpipeOutputCastInfo{matmulOp,      layoutOp, scaleOp,
+                               scaleSplatOp, castOp,   quantScale,
+                               *preQuantMode};
 }
 
 Operation *getSourceThroughCIntermediateOps(Value operand) {

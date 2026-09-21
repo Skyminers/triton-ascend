@@ -43,6 +43,7 @@
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
 #include "ascend/include/DynamicCVPipeline/Passes.h"
+#include "ascend/include/DynamicCVPipeline/PairedF16AccOwnership.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlock/Passes.h"
 #include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
 #include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
@@ -70,6 +71,12 @@ static std::optional<int64_t> getErrorCode(ModuleOp moduleOp) {
       moduleOp->getAttrOfType<IntegerAttr>(CVPipeline::ERRCODE_ATTR);
   return errCodeAttr ? std::optional<int64_t>(errCodeAttr.getInt())
                      : std::nullopt;
+}
+
+static void removePairedF16SchedulingHints(ModuleOp moduleOp) {
+  moduleOp.walk([](Operation *op) {
+    op->removeAttr(mlir::triton::kLoopCarriedReadBeforeUpdate);
+  });
 }
 
 static inline void addPasses(OpPassManager &pm) {
@@ -115,11 +122,17 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   auto moduleOp = getOperation();
   OpBuilder builder(moduleOp.getContext());
   compileOn91095Flag = this->compileOn91095;
+  bool coalescePairedF16Score = false;
+  moduleOp.walk([&](func::FuncOp func) {
+    coalescePairedF16Score |=
+        func->hasAttr(mlir::triton::kLoopCarriedReadBeforeUpdate);
+  });
 
   LDBG("Enter pass");
   moduleOp->removeAttr(CVPipeline::ERRCODE_ATTR);
 
   if (!compileOn91095Flag) {
+    removePairedF16SchedulingHints(moduleOp);
     llvm::errs() << "Add-dynamic-cv-pipeline is only supported on 91095 now.\n";
     return;
   }
@@ -154,6 +167,19 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     auto result = pm.run(moduleOp);
     auto errCode = getErrorCode(moduleOp);
     if (succeeded(result) && !errCode.has_value()) {
+      if (coalescePairedF16Score &&
+          failed(mlir::triton::coalescePairedF16ScoreBuffers(moduleOp))) {
+        moduleOp.emitWarning()
+            << "[" << DEBUG_TYPE << "] "
+            << "Could not prove paired FP16 score-buffer coalescing; "
+               "falling back to compilation without dynamic CV pipeline.";
+        fallback.restore();
+        removePairedF16SchedulingHints(moduleOp);
+        moduleOp->setAttr(CVPipeline::ERRCODE_ATTR,
+                          builder.getI32IntegerAttr(
+                              CVPipeline::ERRCODE_FAILED));
+        return;
+      }
       LDBG("Process successfully");
       return;
     }
@@ -190,6 +216,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
     }
 
     fallback.restore();
+    removePairedF16SchedulingHints(moduleOp);
     moduleOp->setAttr(CVPipeline::ERRCODE_ATTR,
                       builder.getI32IntegerAttr(
                           errCode.value_or(CVPipeline::ERRCODE_FAILED)));
@@ -197,6 +224,7 @@ void AddDynamicCVPipelinePass::runOnOperation() {
   }
 
   checkAndDisableVfSub(moduleOp);
+  removePairedF16SchedulingHints(moduleOp);
   LDBG("Process successfully");
 }
 

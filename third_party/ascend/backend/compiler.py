@@ -361,6 +361,17 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
             except Exception:
                 pass  # graceful fallback: pass runs without hint
 
+        if opt.paired_f16_pv_accumulate:
+            if not compile_on_910_95 or not metadata["enable_dynamic_cv_pipeline"]:
+                raise RuntimeError(
+                    "paired_f16_pv_accumulate requires Ascend950 and enable_dynamic_cv_pipeline")
+            attr_builder = ascend.ir.ascendnpu_ir_builder(mod.context, opt.target_arch)
+            # Function attributes on tt.func are not preserved by the
+            # Triton-to-func conversion. Carry one transient module marker for
+            # the task-shaping pass; DynamicCV remains the sole CV scheduler.
+            mod.set_attr("ascend.request_paired_f16_pv_accumulate",
+                         attr_builder.parse_attr("unit"))
+
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         if distributed is not None:
@@ -385,6 +396,11 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         # bishengir-opt, so the loss happens in code generation.
         if compile_on_910_95:
             ascend.passes.ttir.add_merge_concat_load_buffer(pm)
+        if opt.paired_f16_pv_accumulate:
+            # Form computation tasks and prove accumulator ownership before the
+            # generic DynamicCV ssbuffer scheduler sees the module.
+            ascend.passes.ttir.add_paired_f16_task_shaping(pm)
+
         if metadata["enable_dynamic_cv_pipeline"]:
             metadata["set_workspace_multibuffer"] = 0
             metadata["enable_mixed_cv"] = True
@@ -1244,6 +1260,9 @@ class NPUOptions:
     disable_auto_inject_block_sync: bool = None
     enable_mixed_cv: bool = None
     enable_dynamic_cv_pipeline: bool = None
+    # Opt in to paired PV task formation only. DynamicCV ssbuffer remains the
+    # sole owner of buffering, control flow and Cube/Vector scheduling.
+    paired_f16_pv_accumulate: bool = False
     enable_cube_block_merge: bool = False
     hfusion_enable_multiple_consumer_fusion: bool = None
     buf_slot_num_of_veccore: int = None

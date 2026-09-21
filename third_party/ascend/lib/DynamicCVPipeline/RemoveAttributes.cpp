@@ -31,6 +31,7 @@
 #include "mlir/Pass/PassRegistry.h"
 
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PairedF16AccOwnership.h"
 #include "ascend/include/DynamicCVPipeline/RemoveAttributes.h"
 
 using namespace mlir;
@@ -55,7 +56,7 @@ static constexpr llvm::StringLiteral kAttrsToRemove[]{
     kLoadStoreBufCount, kInsertionOptimization,
     kDepMark,           kIntraDeps,
     kSubBlock,          kMergeSmallBlockFirstRunDone,
-    kSplittedIf};
+    kSplittedIf,         mlir::triton::kLoopCarriedReadBeforeUpdate};
 
 void RemoveSsbufAttrPass::runOnOperation() {
   auto module = getOperation();

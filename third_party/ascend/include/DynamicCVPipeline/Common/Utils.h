@@ -22,6 +22,7 @@
 
 #ifndef ADD_AUTO_SCHEDULING_COMMON_UTILS_H
 #define ADD_AUTO_SCHEDULING_COMMON_UTILS_H
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -335,6 +336,27 @@ inline bool isTensorComputeOp(Operation *op) {
 // - arith.trunci: i32 -> i8
 std::optional<hivm::FixpipePreQuantMode>
 getFixpipePreQuantMode(Operation *truncOp);
+
+// Describes a result conversion that can be emitted directly by FIXPIPE. The
+// optional layout op represents the physical output layout selected for the
+// transfer; the cast supplies the FIXPIPE pre_quant mode.
+struct FixpipeOutputCastInfo {
+  linalg::MatmulOp matmulOp;
+  Operation *layoutOp = nullptr;
+  arith::MulFOp scaleOp;
+  linalg::FillOp scaleSplatOp;
+  Operation *castOp = nullptr;
+  Value quantScale;
+  hivm::FixpipePreQuantMode preQuantMode;
+};
+
+// Match by FIXPIPE capabilities rather than by a specific consumer topology:
+//   matmul -> [supported output-layout conversion] -> [scalar scale] -> cast
+// The optional layout conversion and scale may occur in either order. The
+// producer may have other users; callers decide which result edge crosses a
+// compute-core boundary.
+std::optional<FixpipeOutputCastInfo>
+matchFixpipeOutputCast(Operation *castOp);
 
 // Trace an operand's defining op back through C2C intermediate ops to find the
 // underlying producing op. Returns null when the operand has no defining op.

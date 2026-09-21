@@ -864,22 +864,55 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
   LOG_DEBUG("Inserting [Cube->Vector] transfer for value: " << srcValue
                                                             << "\n");
   auto srcTensorType = cast<RankedTensorType>(srcValue.getType());
-  int64_t M = srcTensorType.getDimSize(0);
-  int64_t N = srcTensorType.getDimSize(1);
   Type elemType = srcTensorType.getElementType();
 
   int cubeBlockId =
       CVPipeline::getOpBlockId(srcValue.getDefiningOp()).value_or(-1);
   int vecBlockId = CVPipeline::getOpBlockId(vectorStartOp).value_or(-1);
 
-  auto targetShape = dep.isAllTranspoesd ? std::vector<int64_t>{N, M}
-                                         : std::vector<int64_t>{M, N};
+  // OpClassifier keeps a FIXPIPE-representable output cast on CUBE. Reuse the
+  // same capability matcher here so classification, dependency analysis, and
+  // transfer folding cannot disagree about the supported producer chain.
+  Operation *foldedTruncOp = nullptr;
+  Operation *foldedScaleOp = nullptr;
+  Operation *foldedScaleSplatOp = nullptr;
+  Operation *foldedConvertOp = nullptr;
+  std::optional<FixpipePreQuantMode> quantMode;
+  Value quantScale;
+  Value fixpipeSrcValue = dep.realValue ? dep.realValue : srcValue;
+  bool foldedNzOutput = false;
+  std::vector<int64_t> targetShape;
+  if (!dep.realValue) {
+    if (auto info =
+            CVPipeline::matchFixpipeOutputCast(srcValue.getDefiningOp())) {
+      quantMode = info->preQuantMode;
+      fixpipeSrcValue = info->matmulOp.getResult(0);
+      targetShape.assign(srcTensorType.getShape().begin(),
+                         srcTensorType.getShape().end());
+      foldedTruncOp = info->castOp;
+      foldedScaleOp = info->scaleOp;
+      foldedScaleSplatOp = info->scaleSplatOp;
+      foldedConvertOp = info->layoutOp;
+      quantScale = info->quantScale;
+      foldedNzOutput = info->layoutOp != nullptr;
+    }
+  }
+
+  int64_t M = 0;
+  int64_t N = 0;
+  if (!foldedTruncOp) {
+    M = srcTensorType.getDimSize(0);
+    N = srcTensorType.getDimSize(1);
+    targetShape = dep.isAllTranspoesd ? std::vector<int64_t>{N, M}
+                                      : std::vector<int64_t>{M, N};
+  }
+
   // Keep an explicitly requested NZ16 score layout across the C->V edge.
   // Only fold when every consumer in this block requests the same full NZ
   // tensor; mixed ND/NZ consumers keep the existing transfer behavior.
   SmallVector<hivm::ConvertLayoutOp> nzConsumers;
-  if (!dep.isAllTranspoesd && !dep.consumerYieldOp && M % 16 == 0 &&
-      N % 16 == 0) {
+  if (!foldedTruncOp && !dep.isAllTranspoesd && !dep.consumerYieldOp &&
+      M % 16 == 0 && N % 16 == 0) {
     bool compatible = true;
     for (Operation *user : srcValue.getUsers()) {
       if (CVPipeline::getOpBlockId(user).value_or(-1) != dep.iniConsumerBlockId)
@@ -912,20 +945,21 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
       vectorStartOp, cubeBlockId, vecBlockId, CVPipeline::kCoreTypeCube,
       CVPipeline::kCoreTypeVector, transferIndex);
   auto dmaModeAttr = FixpipeDMAModeAttr::get(
-      builder.getContext(), !nzConsumers.empty()  ? FixpipeDMAMode::NZ2NZ
-                            : dep.isAllTranspoesd ? FixpipeDMAMode::NZ2DN
-                                                  : FixpipeDMAMode::NZ2ND);
+      builder.getContext(),
+      (foldedNzOutput || !nzConsumers.empty()) ? FixpipeDMAMode::NZ2NZ
+      : dep.isAllTranspoesd                     ? FixpipeDMAMode::NZ2DN
+                                                : FixpipeDMAMode::NZ2ND);
+  FixpipePreQuantModeAttr quantModeAttr = nullptr;
+  if (quantMode)
+    quantModeAttr =
+        FixpipePreQuantModeAttr::get(builder.getContext(), *quantMode);
 
-  auto realValue = dep.value;
-  if (dep.realValue) {
-    realValue = dep.realValue;
-  }
   auto fixpipeOp = builder.create<hivm::FixpipeOp>(
       loc, mlir::TypeRange{},    // No return value
-      realValue,                 // src
+      fixpipeSrcValue,           // src
       cubeAllocOp->getResult(0), // dst
-      mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, nullptr, nullptr,
-      nullptr, nullptr, nullptr, mlir::ArrayAttr{}, nullptr);
+      mlir::ValueRange{}, dmaModeAttr, nullptr, nullptr, quantModeAttr, nullptr,
+      nullptr, nullptr, quantScale, mlir::ArrayAttr{}, nullptr);
   attachTransferTags(fixpipeOp, cubeBlockId, CVPipeline::kCoreTypeCube,
                      transferIndex);
   attachCrossCoreDeps(fixpipeOp, transferIndex, CVPipeline::crossCoreProducerId,
@@ -989,6 +1023,14 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
   if (consumedDataOp) {
     *consumedDataOp = toTensorOp;
   }
+  if (foldedTruncOp && foldedTruncOp->use_empty())
+    foldedTruncOp->erase();
+  if (foldedScaleOp && foldedScaleOp->use_empty())
+    foldedScaleOp->erase();
+  if (foldedConvertOp && foldedConvertOp->use_empty())
+    foldedConvertOp->erase();
+  if (foldedScaleSplatOp && foldedScaleSplatOp->use_empty())
+    foldedScaleSplatOp->erase();
   return fixpipeOp;
 }
 

@@ -19,6 +19,18 @@ def AddDynamicCVPipeline : Pass<"add_dynamic_cv_pipeline", "mlir::ModuleOp"> {
     let dependentDialects = ["hivm::HIVMDialect", "bufferization::BufferizationDialect", "scope::ScopeDialect", "annotation::AnnotationDialect", "LLVM::LLVMDialect"];
 }
 
+def PairedF16PVAccumulatePass : Pass<"paired-f16-pv-accumulate", "mlir::ModuleOp"> {
+  let summary = "Form opt-in exclusive FP16 paired-softmax PV accumulator chains";
+  let constructor = "triton::createPairedF16PVAccumulatePass()";
+  let dependentDialects = ["arith::ArithDialect", "func::FuncDialect", "linalg::LinalgDialect", "scf::SCFDialect", "tensor::TensorDialect", "hivm::HIVMDialect"];
+}
+
+def PairedF16AccOwnershipPass : Pass<"paired-f16-acc-ownership", "mlir::ModuleOp"> {
+  let summary = "Prove and mark paired FP16 accumulator destinations";
+  let constructor = "triton::createPairedF16AccOwnershipPass()";
+  let dependentDialects = ["arith::ArithDialect", "bufferization::BufferizationDialect", "func::FuncDialect", "linalg::LinalgDialect", "scf::SCFDialect", "hivm::HIVMDialect"];
+}
+
 def PreCheckAvailablePass : Pass<"pre-check-dynamic-cv-pipeline-available", "mlir::ModuleOp"> {
   let summary = "Check whether dynamic cv pipeline can process the input module";
   let constructor = "triton::createPreCheckAvailablePass()";

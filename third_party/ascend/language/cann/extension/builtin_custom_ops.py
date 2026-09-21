@@ -107,20 +107,31 @@ class _index_select:
 
 @register_custom_op
 class _online_softmax_nz:
-    """A5 SIMD online softmax; implemented in the AscendNPU-IR template library."""
+    """A5 SIMD online softmax with N=256 or restricted N=512 row ABI.
+
+    N=512 requires dedicated bufferization (single score slot, same-root P
+    with strides [128*M, 1024, 64, 1]) and a matching kernel template; this
+    registration only checks tensor shapes, not in-place buffer reuse.
+    FP16 N512 uses half old/new m, FP32 block_sum and P strides
+    [64*M, 512, 32, 1]; FP32 N256/N512 remains unchanged.
+    """
     name = '__builtin_online_softmax_nz'
     core = CORE.VECTOR
     pipe = PIPE.PIPE_V
     mode = MODE.SIMD
 
     def __init__(self, scores, m, indices, out=None):
-        assert scores.dtype == m.dtype == tl.float32
+        assert scores.dtype in (tl.float16, tl.float32)
+        assert m.dtype == scores.dtype, "m must match score dtype"
+        assert scores.dtype != tl.float16 or scores.type.shape[0] == 32, \
+            "FP16 online_softmax_nz requires N=512"
         assert len(scores.type.shape) == 4, "scores must be rank-4 NZ16"
         n1, m1, m0, n0 = scores.type.shape
-        assert (n1, m0, n0) == (16, 16, 16) and m1 in (2, 4, 8), \
-            "online_softmax_nz supports M=32/64/128, N=256"
+        assert n1 in (16, 32) and (m0, n0) == (16, 16) and m1 in (2, 4, 8), \
+            "online_softmax_nz supports M=32/64/128, N=256 or restricted N=512"
         assert m.type.shape == [m1 * 16]
         assert indices.dtype == tl.uint8 and indices.type.shape == [256]
         assert out is not None and len(out) == 3
-        assert out[0].dtype == tl.float8e4nv and out[0].type.shape == [8, m1, 16, 32]
-        assert all(x.dtype == tl.float32 and x.type.shape == [m1 * 16] for x in out[1:])
+        assert out[0].dtype == tl.float8e4nv and out[0].type.shape == [n1 // 2, m1, 16, 32]
+        assert out[1].dtype == scores.dtype and out[1].type.shape == [m1 * 16]
+        assert out[2].dtype == tl.float32 and out[2].type.shape == [m1 * 16]

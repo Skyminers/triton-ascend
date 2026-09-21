@@ -23,8 +23,10 @@
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/UpdateLoopOps.h"
 #include "ascend/include/DynamicCVPipeline/AddControlFlowCondition/Utils.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PairedF16AccOwnership.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
@@ -579,8 +581,15 @@ LogicalResult UpdateLoopOpsPass::analyzeTensorIterArgDependencies(
     // whileOp: getAfterArguments() (before-block args aren't visible in body).
     llvm::SmallVector<Value> iterArgsVec = MainLoop(op).getIterArgs();
 
-    for (auto iterArg : iterArgsVec) {
+    auto function = op->getParentOfType<func::FuncOp>();
+    auto allowedRead = function ? function->getAttrOfType<IntegerAttr>(
+                                      kLoopCarriedReadBeforeUpdate)
+                                : IntegerAttr{};
+    for (auto [iterArgIndex, iterArg] : llvm::enumerate(iterArgsVec)) {
       if (!mlir::isa<TensorType>(iterArg.getType())) {
+        continue;
+      }
+      if (allowedRead && allowedRead.getInt() == iterArgIndex) {
         continue;
       }
 

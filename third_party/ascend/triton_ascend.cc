@@ -134,6 +134,11 @@ void init_triton_ascend_passes_ttir(py::module &&m) {
     pm.addPass(mlir::triton::createBubbleUpOperationPass());
   });
 
+  m.def("add_paired_f16_task_shaping", [](mlir::PassManager &pm) {
+    pm.addPass(mlir::triton::createPairedF16PVAccumulatePass());
+    pm.addPass(mlir::triton::createPairedF16AccOwnershipPass());
+  });
+
   m.def("add_dynamic_cv_pipeline",
         [](mlir::PassManager &pm, bool compileOn91095) {
           AddDynamicCVPipelineOptions opts;

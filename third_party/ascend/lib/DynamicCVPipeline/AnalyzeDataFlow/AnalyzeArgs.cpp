@@ -23,6 +23,7 @@
 #include "ascend/include/DynamicCVPipeline/AnalyzeDataFlow.h"
 #include "ascend/include/DynamicCVPipeline/Common/BufferCountManager.h"
 #include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/PairedF16AccOwnership.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -57,6 +58,16 @@ struct TensorArgBlockInfo {
   llvm::DenseSet<int> blockIds;
 };
 
+static bool isProvedLoopCarriedRead(Block *body, unsigned iterArgIndex) {
+  if (!body)
+    return false;
+  auto function = body->getParentOp()->getParentOfType<func::FuncOp>();
+  auto allowedRead = function ? function->getAttrOfType<IntegerAttr>(
+                                    mlir::triton::kLoopCarriedReadBeforeUpdate)
+                              : IntegerAttr{};
+  return allowedRead && allowedRead.getInt() == iterArgIndex;
+}
+
 // Collect block info for all tensor-type iter_args in the given body.
 static llvm::DenseMap<unsigned, TensorArgBlockInfo>
 collectTensorArgBlockInfo(ArrayRef<Value> iterArgs, Block *body) {
@@ -88,9 +99,11 @@ collectTensorArgBlockInfo(ArrayRef<Value> iterArgs, Block *body) {
 
 // Check if any tensor-type iter_arg appears in different block_ids.
 static bool checkMultiBlockUse(
-    const llvm::DenseMap<unsigned, TensorArgBlockInfo> &argBlockInfo) {
+    const llvm::DenseMap<unsigned, TensorArgBlockInfo> &argBlockInfo,
+    Block *body) {
   for (auto &p : argBlockInfo) {
-    if (p.second.blockIds.size() > 1)
+    if (p.second.blockIds.size() > 1 &&
+        !isProvedLoopCarriedRead(body, p.first))
       return true;
   }
   return false;
@@ -105,6 +118,8 @@ static bool checkUseUpdateMismatch(
 
   for (unsigned i = 0; i < iterArgs.size(); ++i) {
     if (!isa<RankedTensorType>(iterArgs[i].getType()))
+      continue;
+    if (isProvedLoopCarriedRead(body, i))
       continue;
 
     auto it = argBlockInfo.find(i);
@@ -125,7 +140,7 @@ static bool checkUseUpdateMismatch(
 static bool hasTensorArgInDifferentBlockIds(ArrayRef<Value> iterArgs,
                                             Block *body) {
   auto argBlockInfo = collectTensorArgBlockInfo(iterArgs, body);
-  return checkMultiBlockUse(argBlockInfo) ||
+  return checkMultiBlockUse(argBlockInfo, body) ||
          checkUseUpdateMismatch(iterArgs, body, argBlockInfo);
 }
 
@@ -139,7 +154,7 @@ static bool checkUpdateBeforeUse(ArrayRef<Value> iterArgs, Block *body) {
   if (!yieldOp)
     return false;
 
-  for (Value iterArg : iterArgs) {
+  for (auto [iterArgIndex, iterArg] : llvm::enumerate(iterArgs)) {
     if (!isa<RankedTensorType>(iterArg.getType()))
       continue;
 
@@ -159,8 +174,20 @@ static bool checkUpdateBeforeUse(ArrayRef<Value> iterArgs, Block *body) {
       if (!defOp->isBeforeInBlock(directChild))
         continue;
 
-      if (CVPipeline::getOpBlockId(directChild) != defBlockId)
-        return true;
+      if (CVPipeline::getOpBlockId(directChild) == defBlockId)
+        continue;
+
+      auto function = directChild->getParentOfType<func::FuncOp>();
+      auto allowedRead = function ? function->getAttrOfType<IntegerAttr>(
+                                        mlir::triton::kLoopCarriedReadBeforeUpdate)
+                                  : IntegerAttr{};
+      auto oldValueExt = dyn_cast<arith::ExtFOp>(directChild);
+      if (allowedRead && allowedRead.getInt() == iterArgIndex && oldValueExt &&
+          oldValueExt.getIn() == iterArg) {
+        continue;
+      }
+
+      return true;
     }
   }
   return false;
