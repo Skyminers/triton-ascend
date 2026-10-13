@@ -1,6 +1,8 @@
 // RUN: triton-opt %S/Inputs/paired-f16-recurrence.mlir --paired-f16-pv-accumulate -o %t.pv
 // RUN: triton-opt %t.pv --paired-f16-acc-ownership --verify-each -o %t.owned
 // RUN: FileCheck %s < %t.owned
+// RUN: sed -e '/%c32768 =/i\    %causal_limits = arith.constant dense<511> : tensor<128xi32>' -e 's/ins(%77, %arg18, %23 : tensor<32x8x16x16xf16>, tensor<128xf16>, tensor<256xi8>)/ins(%77, %arg18, %23, %causal_limits : tensor<32x8x16x16xf16>, tensor<128xf16>, tensor<256xi8>, tensor<128xi32>)/' %S/Inputs/paired-f16-recurrence.mlir > %t.causal
+// RUN: triton-opt %t.causal --paired-f16-pv-accumulate --paired-f16-acc-ownership --verify-each | FileCheck %s
 // RUN: sed 's/arith.addf %95, %94/arith.addf %95, %95/' %S/Inputs/paired-f16-recurrence.mlir | not triton-opt --paired-f16-pv-accumulate --paired-f16-acc-ownership 2>&1 | FileCheck %s --check-prefix=REJECT
 // RUN: sed 's/arith.extf %arg18/arith.extf %78#1/' %S/Inputs/paired-f16-recurrence.mlir | not triton-opt --paired-f16-pv-accumulate --paired-f16-acc-ownership 2>&1 | FileCheck %s --check-prefix=REJECT
 

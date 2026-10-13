@@ -120,7 +120,7 @@ class _online_softmax_nz:
     pipe = PIPE.PIPE_V
     mode = MODE.SIMD
 
-    def __init__(self, scores, m, indices, out=None):
+    def __init__(self, scores, m, indices, causal_limits=None, mask_required=None, out=None):
         assert scores.dtype in (tl.float16, tl.float32)
         assert m.dtype == scores.dtype, "m must match score dtype"
         assert scores.dtype != tl.float16 or scores.type.shape[0] == 32, \
@@ -131,6 +131,16 @@ class _online_softmax_nz:
             "online_softmax_nz supports M=32/64/128, N=256 or restricted N=512"
         assert m.type.shape == [m1 * 16]
         assert indices.dtype == tl.uint8 and indices.type.shape == [256]
+        if causal_limits is not None:
+            assert scores.dtype == tl.float16 and n1 == 32, \
+                "causal_limits requires FP16 N=512 online_softmax_nz"
+            assert causal_limits.dtype == tl.int32 and causal_limits.type.shape == [m1 * 16], \
+                "causal_limits must be an int32 vector with one inclusive column limit per row"
+        if mask_required is not None:
+            assert causal_limits is not None, "mask_required requires causal_limits"
+            assert isinstance(mask_required, bool) or (
+                mask_required.dtype == tl.int1 and len(mask_required.shape) == 0), \
+                "mask_required must be a scalar bool"
         assert out is not None and len(out) == 3
         assert out[0].dtype == tl.float8e4nv and out[0].type.shape == [n1 // 2, m1, 16, 32]
         assert out[1].dtype == scores.dtype and out[1].type.shape == [m1 * 16]

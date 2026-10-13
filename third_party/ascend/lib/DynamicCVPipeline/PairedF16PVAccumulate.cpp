@@ -60,8 +60,11 @@ LogicalResult validateFullPV(hivm::CustomOp custom) {
   auto f16 = Float16Type::get(ctx);
   auto f32 = Float32Type::get(ctx);
   auto fp8 = Float8E4M3FNType::get(ctx);
-  // Tensor V2 ABI. This is not an ownership shortcut for a bufferized custom.
-  if (custom->getNumOperands() != 6 || custom->getNumResults() != 3 ||
+  // Tensor ABI, optionally with per-row causal limits and a scalar mask flag.
+  // This is not an ownership shortcut for a bufferized custom.
+  auto inputs = custom.getInputs();
+  if ((inputs.size() != 3 && inputs.size() != 4 && inputs.size() != 5) ||
+      custom.getOutputs().size() != 3 || custom->getNumResults() != 3 ||
       !isa<scf::ForOp>(custom->getParentOp()) ||
       !hasTensorType(custom->getOperand(0), {32, 8, 16, 16}, f16) ||
       !hasTensorType(custom->getOperand(1), {128}, f16) ||
@@ -70,8 +73,13 @@ LogicalResult validateFullPV(hivm::CustomOp custom) {
       !hasTensorType(custom.getResult(1), {128}, f16) ||
       !hasTensorType(custom.getResult(2), {128}, f32))
     return failure();
+  if (inputs.size() >= 4 &&
+      !hasTensorType(inputs[3], {128}, IntegerType::get(ctx, 32)))
+    return failure();
+  if (inputs.size() == 5 && !inputs[4].getType().isInteger(1))
+    return failure();
   for (unsigned i = 0; i < 3; ++i)
-    if (custom->getOperand(i + 3).getType() != custom.getResult(i).getType())
+    if (custom.getOutputs()[i].getType() != custom.getResult(i).getType())
       return failure();
 
   // Consume the complete logical P[128, 512] in one Cube matmul. The

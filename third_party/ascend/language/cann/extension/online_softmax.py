@@ -8,18 +8,18 @@ from .custom_op import custom_semantic
 
 
 @builtin
-def _online_softmax_nz(scores, m, indices, _semantic=None):
+def _online_softmax_nz(scores, m, indices, causal_limits=None, mask_required=None, _semantic=None):
     rows = scores.type.shape[1] * 16
     outputs = [tl.full((scores.type.shape[0] // 2, rows // 16, 16, 32), 0,
                        tl.float8e4nv, _semantic=_semantic)]
     outputs += [tl.full((rows,), 0, scores.dtype, _semantic=_semantic),
                 tl.full((rows,), 0, tl.float32, _semantic=_semantic)]
-    return custom_semantic("__builtin_online_softmax_nz", scores, m, indices,
+    return custom_semantic("__builtin_online_softmax_nz", scores, m, indices, causal_limits, mask_required,
                            out=outputs, _semantic=_semantic)
 
 
 @triton.jit
-def online_softmax_nz(scores, m):
+def online_softmax_nz(scores, m, causal_limits=None, mask_required=None):
     """Compute an online-softmax tile on Ascend950 (A5).
 
     ``scores`` is FP32 NZ16 [N1, M/16, 16, 16]; N1=16 selects N=256,
@@ -27,7 +27,17 @@ def online_softmax_nz(scores, m):
     N=512 also accepts FP16 scores with FP16 m and m_new; block_sum stays
     FP32. Half state is explicit: arbitrary FP32 m is never rounded silently.
     Callers cast old/new m to FP32 before computing alpha and updating l.
-    M is 32, 64 or 128. Scores must already include scaling and masking.
+    M is 32, 64 or 128. Scores must already include scaling. Without
+    ``causal_limits``, they must also include any masking. FP16 N512 accepts
+    optional int32 [M] ``causal_limits``: each row's last visible local column
+    (inclusive). Columns above the limit are treated as -inf inside softmax,
+    before both the maximum and exponential reductions. For a causal QK tile,
+    pass query_start + arange(M) - key_start. The row vector is partitioned
+    with the score rows on the two-AIV path; no full score mask is allocated.
+    With causal_limits, optional scalar bool ``mask_required`` lets the caller
+    skip masking for a fully visible tile. False requires every row limit to
+    be at least 511. For causal attention, pass key_start + 511 > query_start.
+    The joint N512 maximum and sum are computed once in either path.
 
     Returns (P, m_new, block_sum): P is FP8 E4M3FN NZ32
     [N1/2, M/16, 16, 32]; m_new matches the score dtype and block_sum is FP32 [M].
@@ -59,4 +69,4 @@ def online_softmax_nz(scores, m):
         indices = ((i // 32) * 32 + (i % 16) * 2 + (i % 32) // 16).to(tl.uint8)
     else:
         indices = (((i // 32) * 16 + i % 16) * 4 + (i % 32) // 16).to(tl.uint8)
-    return _online_softmax_nz(scores, m, indices)
+    return _online_softmax_nz(scores, m, indices, causal_limits, mask_required)

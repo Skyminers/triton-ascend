@@ -396,7 +396,9 @@ static FailureOr<OwnershipPlan> matchOwnership(func::FuncOp func) {
     return failure();
 
   auto *ctx = softmax.getContext();
-  if (softmax->getNumOperands() != 6 || softmax->getNumResults() != 3 ||
+  auto inputs = softmax.getInputs();
+  if ((inputs.size() != 3 && inputs.size() != 4 && inputs.size() != 5) ||
+      softmax.getOutputs().size() != 3 || softmax->getNumResults() != 3 ||
       !tensorIs(softmax->getOperand(0), {32, 8, 16, 16},
                 Float16Type::get(ctx)) ||
       !tensorIs(softmax->getOperand(1), {128}, Float16Type::get(ctx)) ||
@@ -406,9 +408,13 @@ static FailureOr<OwnershipPlan> matchOwnership(func::FuncOp func) {
       !tensorIs(softmax->getResult(1), {128}, Float16Type::get(ctx)) ||
       !tensorIs(softmax->getResult(2), {128}, Float32Type::get(ctx)))
     return failure();
+  if (inputs.size() >= 4 &&
+      !tensorIs(inputs[3], {128}, IntegerType::get(ctx, 32)))
+    return failure();
+  if (inputs.size() == 5 && !inputs[4].getType().isInteger(1))
+    return failure();
   for (unsigned i = 0; i < 3; ++i)
-    if (softmax->getOperand(i + 3).getType() !=
-        softmax->getResult(i).getType())
+    if (softmax.getOutputs()[i].getType() != softmax->getResult(i).getType())
       return failure();
 
   auto loop = dyn_cast<scf::ForOp>(softmax->getParentOp());
