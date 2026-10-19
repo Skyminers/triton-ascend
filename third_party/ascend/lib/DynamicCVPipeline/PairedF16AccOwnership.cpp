@@ -148,9 +148,8 @@ static bool equivalentFixpipes(hivm::FixpipeOp thenFixpipe,
       thenFixpipe->getResultTypes() != elseFixpipe->getResultTypes() ||
       thenFixpipe.getDst() != thenDst || elseFixpipe.getDst() != elseDst)
     return false;
-  for (auto [thenOperand, elseOperand] :
-       llvm::zip_equal(thenFixpipe->getOperands(),
-                       elseFixpipe->getOperands())) {
+  for (auto [thenOperand, elseOperand] : llvm::zip_equal(
+           thenFixpipe->getOperands(), elseFixpipe->getOperands())) {
     if (thenOperand == thenDst && elseOperand == elseDst)
       continue;
     if (thenOperand != elseOperand)
@@ -159,9 +158,9 @@ static bool equivalentFixpipes(hivm::FixpipeOp thenFixpipe,
   return true;
 }
 
-static FailureOr<FixpipePair>
-findFixpipePair(ModuleOp module, memref::AllocOp thenAlloc,
-                memref::AllocOp elseAlloc) {
+static FailureOr<FixpipePair> findFixpipePair(ModuleOp module,
+                                              memref::AllocOp thenAlloc,
+                                              memref::AllocOp elseAlloc) {
   FixpipePair result;
   bool multiple = false;
   module.walk([&](scf::IfOp selector) {
@@ -216,8 +215,7 @@ static bool coversDenseConcat(tensor::InsertSliceOp low,
   return true;
 }
 
-static bool hasOnlyReceiverUsers(memref::AllocOp alloc,
-                                 scf::IfOp selector) {
+static bool hasOnlyReceiverUsers(memref::AllocOp alloc, scf::IfOp selector) {
   annotation::MarkOp mark = getTightlyCoupledMark(alloc);
   unsigned allowed = 0;
   for (Operation *user : alloc->getUsers()) {
@@ -233,8 +231,7 @@ static bool hasOnlyReceiverUsers(memref::AllocOp alloc,
   return allowed == 2;
 }
 
-static bool hasOnlyProducerUsers(memref::AllocOp alloc,
-                                 scf::IfOp selector) {
+static bool hasOnlyProducerUsers(memref::AllocOp alloc, scf::IfOp selector) {
   annotation::MarkOp mark = getTightlyCoupledMark(alloc);
   unsigned allowed = 0;
   for (Operation *user : alloc->getUsers()) {
@@ -251,15 +248,15 @@ static bool hasOnlyProducerUsers(memref::AllocOp alloc,
 }
 
 static FailureOr<ScoreBufferPlan> matchScoreBufferPlan(ModuleOp module,
-                                                        hivm::CustomOp custom) {
+                                                       hivm::CustomOp custom) {
   if (custom.getName() != "__builtin_online_softmax_nz" ||
       custom->getNumOperands() == 0)
     return failure();
   auto highInsert =
       custom->getOperand(0).getDefiningOp<tensor::InsertSliceOp>();
-  auto lowInsert = highInsert
-                       ? highInsert.getDest().getDefiningOp<tensor::InsertSliceOp>()
-                       : nullptr;
+  auto lowInsert =
+      highInsert ? highInsert.getDest().getDefiningOp<tensor::InsertSliceOp>()
+                 : nullptr;
   if (!highInsert || !lowInsert || !highInsert->hasOneUse() ||
       !lowInsert->hasOneUse() || !coversDenseConcat(lowInsert, highInsert))
     return failure();
@@ -272,8 +269,8 @@ static FailureOr<ScoreBufferPlan> matchScoreBufferPlan(ModuleOp module,
     return failure();
 
   SmallVector<memref::AllocOp> receiverAllocs{
-      lowReceiver->thenAlloc, lowReceiver->elseAlloc,
-      highReceiver->thenAlloc, highReceiver->elseAlloc};
+      lowReceiver->thenAlloc, lowReceiver->elseAlloc, highReceiver->thenAlloc,
+      highReceiver->elseAlloc};
   llvm::DenseSet<Operation *> receiverSet;
   for (memref::AllocOp alloc : receiverAllocs)
     if (!receiverSet.insert(alloc).second)
@@ -284,8 +281,8 @@ static FailureOr<ScoreBufferPlan> matchScoreBufferPlan(ModuleOp module,
     if (auto id = getTightlyCoupledId(alloc))
       allocsById[*id].push_back(alloc);
   });
-  auto findProducer = [&](memref::AllocOp receiver)
-      -> FailureOr<memref::AllocOp> {
+  auto findProducer =
+      [&](memref::AllocOp receiver) -> FailureOr<memref::AllocOp> {
     auto id = getTightlyCoupledId(receiver);
     if (!id)
       return failure();
@@ -306,8 +303,7 @@ static FailureOr<ScoreBufferPlan> matchScoreBufferPlan(ModuleOp module,
       failed(highProducerThen) || failed(highProducerElse))
     return failure();
 
-  auto lowFixpipe =
-      findFixpipePair(module, *lowProducerThen, *lowProducerElse);
+  auto lowFixpipe = findFixpipePair(module, *lowProducerThen, *lowProducerElse);
   auto highFixpipe =
       findFixpipePair(module, *highProducerThen, *highProducerElse);
   if (failed(lowFixpipe) || failed(highFixpipe) ||
@@ -336,25 +332,24 @@ static FailureOr<ScoreBufferPlan> matchScoreBufferPlan(ModuleOp module,
     if (!sameHalfType(alloc))
       return failure();
 
-  return ScoreBufferPlan{
-      lowInsert,
-      highInsert,
-      *lowReceiver,
-      *highReceiver,
-      *lowProducerThen,
-      *lowProducerElse,
-      *highProducerThen,
-      *highProducerElse,
-      *lowFixpipe,
-      *highFixpipe,
-      getTightlyCoupledMark(lowReceiver->thenAlloc),
-      getTightlyCoupledMark(lowReceiver->elseAlloc),
-      getTightlyCoupledMark(highReceiver->thenAlloc),
-      getTightlyCoupledMark(highReceiver->elseAlloc),
-      getTightlyCoupledMark(*lowProducerThen),
-      getTightlyCoupledMark(*lowProducerElse),
-      getTightlyCoupledMark(*highProducerThen),
-      getTightlyCoupledMark(*highProducerElse)};
+  return ScoreBufferPlan{lowInsert,
+                         highInsert,
+                         *lowReceiver,
+                         *highReceiver,
+                         *lowProducerThen,
+                         *lowProducerElse,
+                         *highProducerThen,
+                         *highProducerElse,
+                         *lowFixpipe,
+                         *highFixpipe,
+                         getTightlyCoupledMark(lowReceiver->thenAlloc),
+                         getTightlyCoupledMark(lowReceiver->elseAlloc),
+                         getTightlyCoupledMark(highReceiver->thenAlloc),
+                         getTightlyCoupledMark(highReceiver->elseAlloc),
+                         getTightlyCoupledMark(*lowProducerThen),
+                         getTightlyCoupledMark(*lowProducerElse),
+                         getTightlyCoupledMark(*highProducerThen),
+                         getTightlyCoupledMark(*highProducerElse)};
 }
 
 static bool tensorIs(Value value, ArrayRef<int64_t> shape, Type elementType) {
@@ -364,7 +359,8 @@ static bool tensorIs(Value value, ArrayRef<int64_t> shape, Type elementType) {
 }
 
 static bool consumesPFull(linalg::MatmulOp matmul, Value p) {
-  auto convert = matmul.getDpsInputs()[0].getDefiningOp<hivm::ConvertLayoutOp>();
+  auto convert =
+      matmul.getDpsInputs()[0].getDefiningOp<hivm::ConvertLayoutOp>();
   return convert && convert.getSource() == p &&
          tensorIs(convert.getResult(), {128, 512},
                   Float8E4M3FNType::get(matmul.getContext()));
@@ -376,8 +372,8 @@ static bool hasLoopCarriedState(func::FuncOp func) {
     if (op.getName() != "__builtin_online_softmax_nz")
       return;
     auto loop = dyn_cast<scf::ForOp>(op->getParentOp());
-    hasState |= loop &&
-                (loop.getNumRegionIterArgs() != 0 || loop.getNumResults() != 0);
+    hasState |=
+        loop && (loop.getNumRegionIterArgs() != 0 || loop.getNumResults() != 0);
   });
   return hasState;
 }
@@ -433,12 +429,11 @@ static FailureOr<OwnershipPlan> matchOwnership(func::FuncOp func) {
 
   auto lAdd = yield.getOperand(1).getDefiningOp<arith::AddFOp>();
   if (!lAdd || lAdd->getBlock() != loop.getBody() ||
-      lAdd.getRhs() != softmax->getResult(2) ||
-      !lAdd.getResult().hasOneUse())
+      lAdd.getRhs() != softmax->getResult(2) || !lAdd.getResult().hasOneUse())
     return failure();
   auto lMul = lAdd.getLhs().getDefiningOp<arith::MulFOp>();
-  if (!lMul || lMul->getBlock() != loop.getBody() ||
-      lMul.getLhs() != args[1] || !lMul.getResult().hasOneUse())
+  if (!lMul || lMul->getBlock() != loop.getBody() || lMul.getLhs() != args[1] ||
+      !lMul.getResult().hasOneUse())
     return failure();
   auto alpha = lMul.getRhs().getDefiningOp<math::ExpOp>();
   if (!alpha || alpha->getBlock() != loop.getBody())
@@ -449,13 +444,11 @@ static FailureOr<OwnershipPlan> matchOwnership(func::FuncOp func) {
     return failure();
   auto oldMaxExt = delta.getLhs().getDefiningOp<arith::ExtFOp>();
   auto nextMaxExt = delta.getRhs().getDefiningOp<arith::ExtFOp>();
-  if (!oldMaxExt || !nextMaxExt ||
-      oldMaxExt->getBlock() != loop.getBody() ||
+  if (!oldMaxExt || !nextMaxExt || oldMaxExt->getBlock() != loop.getBody() ||
       nextMaxExt->getBlock() != loop.getBody() ||
       oldMaxExt.getIn() != args[0] ||
       nextMaxExt.getIn() != softmax->getResult(1) ||
-      !oldMaxExt.getResult().hasOneUse() ||
-      !nextMaxExt.getResult().hasOneUse())
+      !oldMaxExt.getResult().hasOneUse() || !nextMaxExt.getResult().hasOneUse())
     return failure();
 
   auto accAdd = yield.getOperand(2).getDefiningOp<arith::AddFOp>();
@@ -529,8 +522,8 @@ public:
   }
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect, bufferization::BufferizationDialect,
-                    func::FuncDialect, hivm::HIVMDialect,
-                    linalg::LinalgDialect, scf::SCFDialect>();
+                    func::FuncDialect, hivm::HIVMDialect, linalg::LinalgDialect,
+                    scf::SCFDialect>();
   }
   void runOnOperation() override {
     SmallVector<OwnershipPlan> plans;
@@ -538,18 +531,20 @@ public:
       if (!func->hasAttr(kPairedF16PVAccumulate))
         continue;
       if (!func->getAttrOfType<UnitAttr>(kPairedF16PVAccumulate)) {
-        func.emitError("paired FP16 accumulator ownership requires a unit PV opt-in");
+        func.emitError(
+            "paired FP16 accumulator ownership requires a unit PV opt-in");
         return signalPassFailure();
       }
       auto plan = matchOwnership(func);
       if (failed(plan)) {
         // A single KV512 tile is fully unrolled and has no loop-carried state.
-        // It still needs PV task formation, but there is no recurrence ownership
-        // to prove or annotate.
+        // It still needs PV task formation, but there is no recurrence
+        // ownership to prove or annotate.
         if (!hasLoopCarriedState(func))
           continue;
-        func.emitError("paired FP16 accumulator ownership requires an exclusive "
-                       "loop-carried acc recurrence and terminal normalize");
+        func.emitError(
+            "paired FP16 accumulator ownership requires an exclusive "
+            "loop-carried acc recurrence and terminal normalize");
         return signalPassFailure();
       }
       plans.push_back(*plan);
@@ -557,10 +552,7 @@ public:
     Builder builder(&getContext());
     auto operandZero = builder.getI64IntegerAttr(0);
     for (const OwnershipPlan &plan : plans) {
-      // Keep the old running maximum live only before the softmax update.  The
-      // cast is independent of the custom op, and moving it makes the true SSA
-      // order explicit to the double-buffer scheduler instead of looking like
-      // an update-before-use recurrence across vector blocks.
+      // Read the old maximum before softmax updates its shared state buffer.
       if (plan.softmax->isBeforeInBlock(plan.oldMaxExt))
         plan.oldMaxExt->moveBefore(plan.softmax);
       plan.function->setAttr(kLoopCarriedReadBeforeUpdate, operandZero);
@@ -605,13 +597,11 @@ LogicalResult mlir::triton::coalescePairedF16ScoreBuffers(ModuleOp module) {
   IRRewriter rewriter(module.getContext());
   auto fullTensorType = cast<RankedTensorType>(plan.highInsert.getType());
   auto halfType = plan.lowReceiver.thenAlloc.getType();
-  auto fullType = MemRefType::get(fullTensorType.getShape(),
-                                  fullTensorType.getElementType(),
-                                  MemRefLayoutAttrInterface{},
-                                  halfType.getMemorySpace());
+  auto fullType = MemRefType::get(
+      fullTensorType.getShape(), fullTensorType.getElementType(),
+      MemRefLayoutAttrInterface{}, halfType.getMemorySpace());
 
-  auto createFullPair = [&](memref::AllocOp thenHalf,
-                            memref::AllocOp elseHalf,
+  auto createFullPair = [&](memref::AllocOp thenHalf, memref::AllocOp elseHalf,
                             annotation::MarkOp thenMark,
                             annotation::MarkOp elseMark) {
     Operation *first = thenHalf->isBeforeInBlock(elseHalf)
@@ -631,12 +621,12 @@ LogicalResult mlir::triton::coalescePairedF16ScoreBuffers(ModuleOp module) {
     return std::pair<memref::AllocOp, memref::AllocOp>{thenFull, elseFull};
   };
 
-  auto receiverFull = createFullPair(
-      plan.lowReceiver.thenAlloc, plan.lowReceiver.elseAlloc,
-      plan.lowReceiverThenMark, plan.lowReceiverElseMark);
-  auto producerFull = createFullPair(
-      plan.lowProducerThen, plan.lowProducerElse, plan.lowProducerThenMark,
-      plan.lowProducerElseMark);
+  auto receiverFull =
+      createFullPair(plan.lowReceiver.thenAlloc, plan.lowReceiver.elseAlloc,
+                     plan.lowReceiverThenMark, plan.lowReceiverElseMark);
+  auto producerFull =
+      createFullPair(plan.lowProducerThen, plan.lowProducerElse,
+                     plan.lowProducerThenMark, plan.lowProducerElseMark);
 
   auto createSelectedRoot = [&](Location loc, Value condition,
                                 memref::AllocOp thenFull,
@@ -667,8 +657,8 @@ LogicalResult mlir::triton::coalescePairedF16ScoreBuffers(ModuleOp module) {
       sizes.push_back(rewriter.getIndexAttr(value));
     for (int64_t value : geometry.getStaticStrides())
       strides.push_back(rewriter.getIndexAttr(value));
-    auto viewType = cast<MemRefType>(memref::SubViewOp::inferResultType(
-        fullType, offsets, sizes, strides));
+    auto viewType = cast<MemRefType>(
+        memref::SubViewOp::inferResultType(fullType, offsets, sizes, strides));
     return rewriter.create<memref::SubViewOp>(loc, viewType, root, offsets,
                                               sizes, strides);
   };
@@ -677,10 +667,10 @@ LogicalResult mlir::triton::coalescePairedF16ScoreBuffers(ModuleOp module) {
   // existing transfer/synchronization groups remain intact; only their storage
   // is coalesced into disjoint subviews.
   rewriter.setInsertionPoint(plan.lowFixpipe.selector);
-  auto producerRoot = createSelectedRoot(
-      plan.lowFixpipe.selector.getLoc(),
-      plan.lowFixpipe.selector.getCondition(), producerFull.first,
-      producerFull.second);
+  auto producerRoot =
+      createSelectedRoot(plan.lowFixpipe.selector.getLoc(),
+                         plan.lowFixpipe.selector.getCondition(),
+                         producerFull.first, producerFull.second);
   auto lowView = makeSubview(plan.lowFixpipe.selector.getLoc(),
                              producerRoot.getResult(0), plan.lowInsert);
   IRMapping lowMapping;
@@ -696,9 +686,8 @@ LogicalResult mlir::triton::coalescePairedF16ScoreBuffers(ModuleOp module) {
   rewriter.clone(*plan.highFixpipe.thenFixpipe, highMapping);
   rewriter.eraseOp(plan.highFixpipe.selector);
 
-  // Consumer: select the complete ping/pong score root and feed it directly to
-  // softmax. This removes both tensor inserts and therefore the later 64 KiB
-  // concatenation allocation and its two copies.
+  // Feed the selected full-score root directly to softmax, avoiding concat
+  // copies.
   rewriter.setInsertionPoint(plan.lowInsert);
   auto receiverRoot = createSelectedRoot(
       plan.lowInsert.getLoc(), plan.lowReceiver.selector.getCondition(),
@@ -726,8 +715,8 @@ LogicalResult mlir::triton::coalescePairedF16ScoreBuffers(ModuleOp module) {
   SmallVector<memref::AllocOp> oldAllocs{
       plan.lowReceiver.thenAlloc,  plan.lowReceiver.elseAlloc,
       plan.highReceiver.thenAlloc, plan.highReceiver.elseAlloc,
-      plan.lowProducerThen,         plan.lowProducerElse,
-      plan.highProducerThen,        plan.highProducerElse};
+      plan.lowProducerThen,        plan.lowProducerElse,
+      plan.highProducerThen,       plan.highProducerElse};
   for (memref::AllocOp alloc : oldAllocs) {
     if (!alloc->use_empty())
       return failure();

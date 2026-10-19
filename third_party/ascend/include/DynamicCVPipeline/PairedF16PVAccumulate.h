@@ -3,15 +3,13 @@
 #ifndef TRITON_ASCEND_PAIRED_F16_PV_ACCUMULATE_H
 #define TRITON_ASCEND_PAIRED_F16_PV_ACCUMULATE_H
 
-#include "llvm/ADT/StringRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/StringRef.h"
 #include <memory>
 
 namespace mlir::triton {
-// Explicit numerical opt-in on func.func; never inferred from a kernel name.
-// This permits the restricted PV reduction-order change, not unsafe aliasing
-// or a claim that delay-two scheduling has been implemented.
+// Opt in to validation of the existing full-width K512 PV task.
 inline constexpr llvm::StringLiteral kPairedF16PVAccumulate =
     "ascend.paired_f16_pv_accumulate";
 std::unique_ptr<OperationPass<ModuleOp>> createPairedF16PVAccumulatePass();

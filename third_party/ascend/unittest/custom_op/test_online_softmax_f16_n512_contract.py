@@ -23,11 +23,18 @@ def tensor(dtype, shape):
 
 
 @pytest.mark.parametrize("rows", [32, 64, 128])
-@pytest.mark.parametrize("dtype,n1", [("f16", 32), ("f32", 16), ("f32", 32)])
-def test_f16_n512_registration_and_f32_preserved(registration, rows, dtype, n1):
-    registration(tensor(dtype, [n1, rows // 16, 16, 16]), tensor(dtype, [rows]),
-                 tensor("u8", [256]), out=[tensor("f8", [n1 // 2, rows // 16, 16, 32]),
-                 tensor(dtype, [rows]), tensor("f32", [rows])])
+def test_f16_n512_registration(registration, rows):
+    registration(tensor("f16", [32, rows // 16, 16, 16]), tensor("f16", [rows]),
+                 tensor("u8", [256]), out=[tensor("f8", [16, rows // 16, 16, 32]),
+                 tensor("f16", [rows]), tensor("f32", [rows])])
+
+
+@pytest.mark.parametrize("dtype,n1", [("f16", 16), ("f32", 16), ("f32", 32)])
+def test_reject_unsupported_score_abi(registration, dtype, n1):
+    with pytest.raises(AssertionError):
+        registration(tensor(dtype, [n1, 4, 16, 16]), tensor(dtype, [64]),
+                     tensor("u8", [256]), out=[tensor("f8", [n1 // 2, 4, 16, 32]),
+                     tensor(dtype, [64]), tensor("f32", [64])])
 
 
 @pytest.mark.parametrize("n1,old,new,total", [(16, "f16", "f16", "f32"),
@@ -48,18 +55,15 @@ def test_f16_n512_causal_limits_registration(registration, rows):
                       tensor("f16", [rows]), tensor("f32", [rows])])
 
 
-@pytest.mark.parametrize("dtype,n1,limit_dtype,limit_shape", [
-    ("f32", 16, "i32", [64]), ("f32", 32, "i32", [64]),
-    ("f16", 32, "f32", [64]), ("f16", 32, "i32", [32]),
-    ("f16", 32, "i32", [64, 1]),
+@pytest.mark.parametrize("limit_dtype,limit_shape", [
+    ("f32", [64]), ("i32", [32]), ("i32", [64, 1]),
 ])
-def test_causal_limits_reject_incompatible_abi(registration, dtype, n1,
-                                               limit_dtype, limit_shape):
+def test_causal_limits_reject_incompatible_abi(registration, limit_dtype, limit_shape):
     with pytest.raises(AssertionError):
-        registration(tensor(dtype, [n1, 4, 16, 16]), tensor(dtype, [64]),
+        registration(tensor("f16", [32, 4, 16, 16]), tensor("f16", [64]),
                      tensor("u8", [256]), causal_limits=tensor(limit_dtype, limit_shape),
-                     out=[tensor("f8", [n1 // 2, 4, 16, 32]),
-                          tensor(dtype, [64]), tensor("f32", [64])])
+                     out=[tensor("f8", [16, 4, 16, 32]),
+                          tensor("f16", [64]), tensor("f32", [64])])
 
 
 @pytest.mark.parametrize("rows", [32, 64, 128])

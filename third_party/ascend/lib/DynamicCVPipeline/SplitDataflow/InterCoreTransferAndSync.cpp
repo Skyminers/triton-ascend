@@ -898,57 +898,22 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
     }
   }
 
-  int64_t M = 0;
-  int64_t N = 0;
   if (!foldedTruncOp) {
-    M = srcTensorType.getDimSize(0);
-    N = srcTensorType.getDimSize(1);
+    int64_t M = srcTensorType.getDimSize(0);
+    int64_t N = srcTensorType.getDimSize(1);
     targetShape = dep.isAllTranspoesd ? std::vector<int64_t>{N, M}
                                       : std::vector<int64_t>{M, N};
   }
 
-  // Keep an explicitly requested NZ16 score layout across the C->V edge.
-  // Only fold when every consumer in this block requests the same full NZ
-  // tensor; mixed ND/NZ consumers keep the existing transfer behavior.
-  SmallVector<hivm::ConvertLayoutOp> nzConsumers;
-  if (!foldedTruncOp && !dep.isAllTranspoesd && !dep.consumerYieldOp &&
-      M % 16 == 0 && N % 16 == 0) {
-    bool compatible = true;
-    for (Operation *user : srcValue.getUsers()) {
-      if (CVPipeline::getOpBlockId(user).value_or(-1) != dep.iniConsumerBlockId)
-        continue;
-      auto convert = dyn_cast<hivm::ConvertLayoutOp>(user);
-      auto type = convert ? dyn_cast<RankedTensorType>(convert.getType())
-                          : RankedTensorType();
-      if (!convert || !type ||
-          convert.getSrcLayout().getTransposeValue().value_or(false) ||
-          convert.getDstLayout().getTransposeValue().value_or(false) ||
-          !convert.getDstLayout().getFractalSizes() ||
-          convert.getDstLayout().getFractalSizes().asArrayRef() !=
-              ArrayRef<int64_t>({16, 16}) ||
-          convert.getSrcLayout().getDataLayout() != hivm::DataLayout::ND ||
-          convert.getDstLayout().getDataLayout() != hivm::DataLayout::Fractal ||
-          type.getShape() != ArrayRef<int64_t>({N / 16, M / 16, 16, 16})) {
-        compatible = false;
-        break;
-      }
-      nzConsumers.push_back(convert);
-    }
-    if (!compatible)
-      nzConsumers.clear();
-  }
-  if (!nzConsumers.empty())
-    targetShape = {N / 16, M / 16, 16, 16};
   auto targetTensorType = RankedTensorType::get(targetShape, elemType);
   auto [cubeAllocOp, vecAllocOp] = createTransferAllocs(
       builder, loc, targetShape, elemType, hivm::AddressSpace::UB, cubeEndOp,
       vectorStartOp, cubeBlockId, vecBlockId, CVPipeline::kCoreTypeCube,
       CVPipeline::kCoreTypeVector, transferIndex);
   auto dmaModeAttr = FixpipeDMAModeAttr::get(
-      builder.getContext(),
-      (foldedNzOutput || !nzConsumers.empty()) ? FixpipeDMAMode::NZ2NZ
-      : dep.isAllTranspoesd                     ? FixpipeDMAMode::NZ2DN
-                                                : FixpipeDMAMode::NZ2ND);
+      builder.getContext(), foldedNzOutput        ? FixpipeDMAMode::NZ2NZ
+                            : dep.isAllTranspoesd ? FixpipeDMAMode::NZ2DN
+                                                  : FixpipeDMAMode::NZ2ND);
   FixpipePreQuantModeAttr quantModeAttr = nullptr;
   if (quantMode)
     quantModeAttr =
@@ -988,16 +953,6 @@ Operation *InterCoreTransferAndSyncPass::insertCubeToVectorTransfer(
     CVPipeline::setSubBlockId(toTensorOp, *subBlockId);
   }
   LOG_DEBUG("[toTensorOp]: " << *toTensorOp << "\n");
-
-  if (!nzConsumers.empty()) {
-    for (auto convert : nzConsumers) {
-      convert.getResult().replaceAllUsesWith(toTensorOp.getResult());
-      convert.erase();
-    }
-    if (consumedDataOp)
-      *consumedDataOp = toTensorOp;
-    return fixpipeOp;
-  }
 
   if (dep.isAllTranspoesd) {
     for (auto *userOp : srcValue.getUsers()) {

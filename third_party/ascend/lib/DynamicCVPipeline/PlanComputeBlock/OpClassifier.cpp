@@ -523,10 +523,7 @@ void OpClassifierPass::matchMaterializePattern(Operation *user) {
   cubeSeeds.push_back(user);
 }
 
-// Keep every FIXPIPE-representable output cast on CUBE, independent of the
-// downstream assembly/consumer topology. The shared capability matcher accepts
-// direct casts and supported output-layout conversions, and does not require the
-// matmul or layout value to have a single use.
+// Keep the matched FIXPIPE cast/scale/layout chain on CUBE.
 void OpClassifierPass::matchFixpipeOutputCastPatterns() {
   for (Operation *op : allOps) {
     auto info = CVPipeline::matchFixpipeOutputCast(op);
@@ -1073,10 +1070,8 @@ int OpClassifierPass::propagateVectorUpstream() {
       if (!def || vecVisited.count(def))
         continue;
 
-      // FIXPIPE emits a matched output cast as part of the producer transfer.
-      // Its VECTOR consumer is the boundary, not a reason to clone the cast onto
-      // VECTOR. This applies to any downstream topology accepted by the shared
-      // capability matcher (slice assembly, elementwise users, stores, etc.).
+      // The matched cast is emitted by FIXPIPE; its consumer defines the
+      // boundary.
       if (fixpipeOutputCastOps.contains(def)) {
         continue;
       }

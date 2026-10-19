@@ -107,33 +107,22 @@ class _index_select:
 
 @register_custom_op
 class _online_softmax_nz:
-    """A5 SIMD online softmax with N=256 or restricted N=512 row ABI.
-
-    N=512 requires dedicated bufferization (single score slot, same-root P
-    with strides [128*M, 1024, 64, 1]) and a matching kernel template; this
-    registration only checks tensor shapes, not in-place buffer reuse.
-    FP16 N512 uses half old/new m, FP32 block_sum and P strides
-    [64*M, 512, 32, 1]; FP32 N256/N512 remains unchanged.
-    """
+    """A5 FP16 N512 ABI; bufferization supplies the same-root strided FP8 P."""
     name = '__builtin_online_softmax_nz'
     core = CORE.VECTOR
     pipe = PIPE.PIPE_V
     mode = MODE.SIMD
 
     def __init__(self, scores, m, indices, causal_limits=None, mask_required=None, out=None):
-        assert scores.dtype in (tl.float16, tl.float32)
-        assert m.dtype == scores.dtype, "m must match score dtype"
-        assert scores.dtype != tl.float16 or scores.type.shape[0] == 32, \
-            "FP16 online_softmax_nz requires N=512"
+        assert scores.dtype == tl.float16, "online_softmax_nz requires FP16 scores"
+        assert m.dtype == tl.float16, "m must be FP16"
         assert len(scores.type.shape) == 4, "scores must be rank-4 NZ16"
         n1, m1, m0, n0 = scores.type.shape
-        assert n1 in (16, 32) and (m0, n0) == (16, 16) and m1 in (2, 4, 8), \
-            "online_softmax_nz supports M=32/64/128, N=256 or restricted N=512"
+        assert n1 == 32 and (m0, n0) == (16, 16) and m1 in (2, 4, 8), \
+            "online_softmax_nz supports M=32/64/128, N=512"
         assert m.type.shape == [m1 * 16]
         assert indices.dtype == tl.uint8 and indices.type.shape == [256]
         if causal_limits is not None:
-            assert scores.dtype == tl.float16 and n1 == 32, \
-                "causal_limits requires FP16 N=512 online_softmax_nz"
             assert causal_limits.dtype == tl.int32 and causal_limits.type.shape == [m1 * 16], \
                 "causal_limits must be an int32 vector with one inclusive column limit per row"
         if mask_required is not None:

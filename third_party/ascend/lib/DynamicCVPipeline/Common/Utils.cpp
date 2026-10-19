@@ -519,18 +519,18 @@ std::optional<hivm::FixpipePreQuantMode> getFixpipePreQuantMode(Operation *op) {
   return std::nullopt;
 }
 
-std::optional<FixpipeOutputCastInfo>
-matchFixpipeOutputCast(Operation *castOp) {
+std::optional<FixpipeOutputCastInfo> matchFixpipeOutputCast(Operation *castOp) {
   if (!castOp)
     return std::nullopt;
   auto preQuantMode = getFixpipePreQuantMode(castOp);
-  if (!preQuantMode || castOp->getNumOperands() != 1 ||
-      castOp->getNumResults() != 1)
+  if (!preQuantMode || *preQuantMode != hivm::FixpipePreQuantMode::F322F16 ||
+      castOp->getNumOperands() != 1 || castOp->getNumResults() != 1)
     return std::nullopt;
 
   auto castInputType =
       dyn_cast<RankedTensorType>(castOp->getOperand(0).getType());
-  auto castOutputType = dyn_cast<RankedTensorType>(castOp->getResult(0).getType());
+  auto castOutputType =
+      dyn_cast<RankedTensorType>(castOp->getResult(0).getType());
   if (!castInputType || !castOutputType || !castInputType.hasStaticShape() ||
       !castOutputType.hasStaticShape() ||
       castInputType.getShape() != castOutputType.getShape())
@@ -544,8 +544,9 @@ matchFixpipeOutputCast(Operation *castOp) {
 
   // FIXPIPE accepts one scalar f32 scale. Tensor lowering represents that scale
   // as linalg.fill(scalar) followed by a no-fastmath elementwise multiply.
-  auto matchScalarSplat = [](Value value, Value data)
-      -> std::optional<std::pair<linalg::FillOp, Value>> {
+  auto matchScalarSplat =
+      [](Value value,
+         Value data) -> std::optional<std::pair<linalg::FillOp, Value>> {
     auto fill = value.getDefiningOp<linalg::FillOp>();
     if (!fill || fill.getInputs().size() != 1 ||
         fill.getOutputs().size() != 1 || fill->getNumResults() != 1 ||
@@ -579,9 +580,9 @@ matchFixpipeOutputCast(Operation *castOp) {
     }
 
     if (!layoutOp) {
-      if (auto convert =
-              producerValue.getDefiningOp<hivm::ConvertLayoutOp>()) {
-        auto srcType = dyn_cast<RankedTensorType>(convert.getSource().getType());
+      if (auto convert = producerValue.getDefiningOp<hivm::ConvertLayoutOp>()) {
+        auto srcType =
+            dyn_cast<RankedTensorType>(convert.getSource().getType());
         auto dstType = dyn_cast<RankedTensorType>(convert.getType());
         auto fractalSizes = convert.getDstLayout().getFractalSizes();
         if (!srcType || !dstType || !srcType.hasStaticShape() ||
@@ -599,8 +600,7 @@ matchFixpipeOutputCast(Operation *castOp) {
         int64_t m = srcType.getDimSize(0);
         int64_t n = srcType.getDimSize(1);
         if (m % 16 != 0 || n % 16 != 0 ||
-            dstType.getShape() !=
-                ArrayRef<int64_t>({n / 16, m / 16, 16, 16}))
+            dstType.getShape() != ArrayRef<int64_t>({n / 16, m / 16, 16, 16}))
           return std::nullopt;
 
         layoutOp = convert;
@@ -612,24 +612,22 @@ matchFixpipeOutputCast(Operation *castOp) {
   }
 
   auto matmulOp = producerValue.getDefiningOp<linalg::MatmulOp>();
-  auto matmulType = matmulOp
-                        ? dyn_cast<RankedTensorType>(matmulOp.getResult(0).getType())
-                        : RankedTensorType{};
+  auto matmulType =
+      matmulOp ? dyn_cast<RankedTensorType>(matmulOp.getResult(0).getType())
+               : RankedTensorType{};
   if (!matmulOp || !matmulType || !matmulType.hasStaticShape() ||
       matmulType.getRank() != 2 || !matmulType.getElementType().isF32())
     return std::nullopt;
 
   if (scaleOp) {
     auto module = castOp->getParentOfType<ModuleOp>();
-    if (*preQuantMode != hivm::FixpipePreQuantMode::F322F16 || !module ||
-        !hacc::utils::isAscend950(module))
+    if (!module || !hacc::utils::isAscend950(module))
       return std::nullopt;
     preQuantMode = hivm::FixpipePreQuantMode::QF322F16_PRE;
   }
 
-  return FixpipeOutputCastInfo{matmulOp,      layoutOp, scaleOp,
-                               scaleSplatOp, castOp,   quantScale,
-                               *preQuantMode};
+  return FixpipeOutputCastInfo{matmulOp, layoutOp,   scaleOp,      scaleSplatOp,
+                               castOp,   quantScale, *preQuantMode};
 }
 
 Operation *getSourceThroughCIntermediateOps(Value operand) {

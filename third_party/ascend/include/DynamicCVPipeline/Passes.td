@@ -20,7 +20,7 @@ def AddDynamicCVPipeline : Pass<"add_dynamic_cv_pipeline", "mlir::ModuleOp"> {
 }
 
 def PairedF16PVAccumulatePass : Pass<"paired-f16-pv-accumulate", "mlir::ModuleOp"> {
-  let summary = "Form opt-in exclusive FP16 paired-softmax PV accumulator chains";
+  let summary = "Validate the opt-in FP16 N512 full-width PV task";
   let constructor = "triton::createPairedF16PVAccumulatePass()";
   let dependentDialects = ["arith::ArithDialect", "func::FuncDialect", "linalg::LinalgDialect", "scf::SCFDialect", "tensor::TensorDialect", "hivm::HIVMDialect"];
 }

@@ -20,53 +20,14 @@ def _online_softmax_nz(scores, m, indices, causal_limits=None, mask_required=Non
 
 @triton.jit
 def online_softmax_nz(scores, m, causal_limits=None, mask_required=None):
-    """Compute an online-softmax tile on Ascend950 (A5).
-
-    ``scores`` is FP32 NZ16 [N1, M/16, 16, 16]; N1=16 selects N=256,
-    N1=32 selects restricted N=512. ``m`` is the FP32 [M] running maximum.
-    N=512 also accepts FP16 scores with FP16 m and m_new; block_sum stays
-    FP32. Half state is explicit: arbitrary FP32 m is never rounded silently.
-    Callers cast old/new m to FP32 before computing alpha and updating l.
-    M is 32, 64 or 128. Scores must already include scaling. Without
-    ``causal_limits``, they must also include any masking. FP16 N512 accepts
-    optional int32 [M] ``causal_limits``: each row's last visible local column
-    (inclusive). Columns above the limit are treated as -inf inside softmax,
-    before both the maximum and exponential reductions. For a causal QK tile,
-    pass query_start + arange(M) - key_start. The row vector is partitioned
-    with the score rows on the two-AIV path; no full score mask is allocated.
-    With causal_limits, optional scalar bool ``mask_required`` lets the caller
-    skip masking for a fully visible tile. False requires every row limit to
-    be at least 511. For causal attention, pass key_start + 511 > query_start.
-    The joint N512 maximum and sum are computed once in either path.
-
-    Returns (P, m_new, block_sum): P is FP8 E4M3FN NZ32
-    [N1/2, M/16, 16, 32]; m_new matches the score dtype and block_sum is FP32 [M].
-    m_new = max(m, rowmax(scores)); P = cast_fp8(exp(scores - m_new));
-    block_sum = rowsum(exp(scores - m_new)). The sum is reduced before FP8
-    quantization. The caller owns running l and alpha updates. All outputs are
-    fully written. Rows are independent; the reduction spans all N columns.
-    Nonfinite rows follow device exp/max/cast semantics (no empty-row zeroing).
-
-    N=256 retains its existing layout and semantics. Restricted N=512 requires
-    a single score buffer slot and a same-root strided P view supplied by
-    dedicated bufferization, plus a matching dedicated kernel template; this
-    frontend does not implement in-place reuse. For R=M rows in each call,
-    score memref strides are [16*R, 256, 16, 1] (FP32 elements), and P strides
-    are [128*R, 1024, 64, 1] (FP8 elements), not dense NZ32. The N=512 two-AIV
-    path requires M=128 before splitting and M=64 per AIV afterwards.
-    For FP16 N512, score strides are the same in half elements; P strides
-    are [64*R, 512, 32, 1] in a shared R*512*2-byte root. FusedExpSub uses
-    half inputs and FP32 register results; both 256-column halves share
-    one maximum and one FP32 sum. No full FP32 score or separate P is needed.
-    """
+    """Return (FP8 NZ32 P, FP16 m_new, FP32 block_sum) for scaled FP16 NZ16 [512/16,M/16,16,16].
+    M=32/64/128; optional int32[M] causal_limits are inclusive local column limits.
+    mask_required=False requires all limits>=511; callers widen m/m_new before alpha and own l updates."""
     tl.static_assert(len(scores.shape) == 4, "scores must be rank-4 NZ16")
-    tl.static_assert((scores.shape[0] == 16 or scores.shape[0] == 32) and
+    tl.static_assert(scores.dtype == tl.float16, "scores must be FP16")
+    tl.static_assert(scores.shape[0] == 32 and
                      scores.shape[2] == 16 and scores.shape[3] == 16)
     tl.static_assert(scores.shape[1] == 2 or scores.shape[1] == 4 or scores.shape[1] == 8)
-    i = tl.arange(0, 256) % 128
-    if scores.dtype == tl.float16:
-        i = tl.arange(0, 256)
-        indices = ((i // 32) * 32 + (i % 16) * 2 + (i % 32) // 16).to(tl.uint8)
-    else:
-        indices = (((i // 32) * 16 + i % 16) * 4 + (i % 32) // 16).to(tl.uint8)
+    i = tl.arange(0, 256)
+    indices = ((i // 32) * 32 + (i % 16) * 2 + (i % 32) // 16).to(tl.uint8)
     return _online_softmax_nz(scores, m, indices, causal_limits, mask_required)

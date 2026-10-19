@@ -350,13 +350,9 @@ struct FixpipeOutputCastInfo {
   hivm::FixpipePreQuantMode preQuantMode;
 };
 
-// Match by FIXPIPE capabilities rather than by a specific consumer topology:
-//   matmul -> [supported output-layout conversion] -> [scalar scale] -> cast
-// The optional layout conversion and scale may occur in either order. The
-// producer may have other users; callers decide which result edge crosses a
-// compute-core boundary.
-std::optional<FixpipeOutputCastInfo>
-matchFixpipeOutputCast(Operation *castOp);
+// Match f32 matmul -> [NZ16 layout/scalar scale, either order] -> f16 cast.
+// Callers select the transfer edge when the producer has other users.
+std::optional<FixpipeOutputCastInfo> matchFixpipeOutputCast(Operation *castOp);
 
 // Trace an operand's defining op back through C2C intermediate ops to find the
 // underlying producing op. Returns null when the operand has no defining op.
